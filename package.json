@@ -1,0 +1,47 @@
+{
+  "package_version": 2,
+  "name": "kam-ai-mcp",
+  "version": "0.1.0",
+  "author": "LiangKam",
+  "editor": ">=3.8.6",
+  "description": "i18n:kam-ai-mcp.description",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@cocos/creator-types": "^3.8.6",
+    "@types/node": "^18.17.1",
+    "typescript": "^5.8.2"
+  },
+  "panels": {
+    "default": {
+      "title": "i18n:kam-ai-mcp.panel_title",
+      "type": "dockable",
+      "main": "dist/panels/default"
+    }
+  },
+  "contributions": {
+    "menu": [
+      {
+        "path": "i18n:menu.extension/kam-ai-mcp",
+        "label": "i18n:kam-ai-mcp.open_panel",
+        "message": "open-panel"
+      }
+    ],
+    "messages": {
+      "open-panel": { "methods": ["openPanel"] },
+      "start-server": { "methods": ["startServer"] },
+      "stop-server": { "methods": ["stopServer"] },
+      "get-server-status": { "methods": ["getServerStatus"] },
+      "get-server-settings": { "methods": ["getServerSettings"] },
+      "update-settings": { "methods": ["updateSettings"] }
+    },
+    "scene": {
+      "script": "./dist/scene.js",
+      "methods": ["ping"]
+    }
+  }
+}
