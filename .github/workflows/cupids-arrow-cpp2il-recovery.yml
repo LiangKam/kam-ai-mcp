@@ -1,0 +1,150 @@
+name: Cupid Arrow Cpp2IL recovery
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-cpp2il-recovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpp2il:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip jq file
+          dotnet tool install --global ilspycmd
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: Build merged public APK input
+        run: |
+          mkdir -p work-cpp/xapk work-cpp/base work-cpp/split work-cpp/tool result-cpp
+          curl -L --fail --retry 4 --retry-all-errors 'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?version=latest' -o work-cpp/current.xapk
+          unzip -q work-cpp/current.xapk -d work-cpp/xapk
+          python - <<'PY'
+          import pathlib,zipfile,shutil,json,hashlib
+          root=pathlib.Path('work-cpp/xapk'); apks=sorted(root.rglob('*.apk'),key=lambda p:p.stat().st_size,reverse=True)
+          base=split=None
+          for p in apks:
+              with zipfile.ZipFile(p) as z:
+                  ns=z.namelist()
+                  if base is None and any(n.endswith('global-metadata.dat') for n in ns): base=p
+                  if split is None and any(n.endswith('libil2cpp.so') for n in ns): split=p
+          if not base or not split: raise SystemExit('pair missing')
+          with zipfile.ZipFile(base) as z: z.extractall('work-cpp/base')
+          with zipfile.ZipFile(split) as z:
+              lib=next(n for n in z.namelist() if n.endswith('libil2cpp.so'))
+              z.extract(lib,'work-cpp/base')
+          # Repack as ordinary APK/ZIP; signing is irrelevant for static analysis.
+          shutil.make_archive('work-cpp/merged','zip','work-cpp/base')
+          shutil.move('work-cpp/merged.zip','work-cpp/merged.apk')
+          def sha(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+          pathlib.Path('result-cpp/input.json').write_text(json.dumps({'base':base.name,'split':split.name,'merged_bytes':pathlib.Path('work-cpp/merged.apk').stat().st_size,'metadata_sha256':sha(next(pathlib.Path('work-cpp/base').rglob('global-metadata.dat'))),'lib_sha256':sha(next(pathlib.Path('work-cpp/base').rglob('libil2cpp.so')))},indent=2))
+          PY
+
+      - name: Download latest Cpp2IL development build
+        run: |
+          curl -L --fail --retry 4 --retry-all-errors 'https://nightly.link/SamboyCoding/Cpp2IL/workflows/dotnet-core/development/Cpp2IL-net9-linux-x64.zip' -o work-cpp/cpp2il.zip
+          unzip -q work-cpp/cpp2il.zip -d work-cpp/tool
+          find work-cpp/tool -type f -maxdepth 3 -printf '%p %s\n' > result-cpp/tool_files.txt
+          chmod +x $(find work-cpp/tool -type f -name 'Cpp2IL*' | head -1)
+          TOOL=$(find work-cpp/tool -type f -name 'Cpp2IL*' -perm -u+x | head -1)
+          echo "$TOOL" > work-cpp/tool_path.txt
+          "$TOOL" --help > result-cpp/help.txt 2>&1 || true
+          "$TOOL" --list-output-formats > result-cpp/output_formats.txt 2>&1 || true
+          "$TOOL" --list-processors > result-cpp/processors.txt 2>&1 || true
+          cat result-cpp/output_formats.txt
+
+      - name: Recover managed DLLs and method dumps
+        run: |
+          TOOL=$(cat work-cpp/tool_path.txt)
+          export NO_COLOR=true
+          set +e
+          "$TOOL" --game-path="$(realpath work-cpp/merged.apk)" --output-as=dll_il_recovery --output-to="$(realpath work-cpp/recovered)" --verbose > result-cpp/cpp2il_dll.log 2>&1
+          echo $? > result-cpp/cpp2il_dll.exit
+          # Try likely metadata/method outputs only when advertised by this exact development build.
+          python - <<'PY'
+          import pathlib,re,json,subprocess,os
+          text=pathlib.Path('result-cpp/output_formats.txt').read_text(errors='replace')
+          names=[]
+          for line in text.splitlines():
+              for m in re.finditer(r'\b[a-z][a-z0-9_-]{2,}\b',line.lower()):
+                  n=m.group()
+                  if any(k in n for k in ('method','metadata','cs','dump','recovery')) and n not in names: names.append(n)
+          pathlib.Path('result-cpp/detected_formats.json').write_text(json.dumps(names,indent=2))
+          tool=pathlib.Path('work-cpp/tool_path.txt').read_text().strip(); apk=str(pathlib.Path('work-cpp/merged.apk').resolve())
+          for n in names:
+              if n=='dll_il_recovery': continue
+              od=pathlib.Path('work-cpp')/('format_'+n); od.mkdir(parents=True,exist_ok=True)
+              log=pathlib.Path('result-cpp')/('cpp2il_'+n+'.log')
+              with log.open('w') as f:
+                  try: p=subprocess.run([tool,'--game-path='+apk,'--output-as='+n,'--output-to='+str(od.resolve()),'--verbose'],stdout=f,stderr=subprocess.STDOUT,text=True,timeout=1800,env={**os.environ,'NO_COLOR':'true'})
+                  except Exception as e: f.write('\nERROR '+repr(e)); continue
+              (pathlib.Path('result-cpp')/('cpp2il_'+n+'.exit')).write_text(str(p.returncode))
+          PY
+          set -e
+          cat result-cpp/cpp2il_dll.log | tail -200
+
+      - name: Decompile target classes from recovered Assembly-CSharp
+        run: |
+          mkdir -p result-cpp/recovered-targets
+          python - <<'PY'
+          import pathlib,json,subprocess,re,shutil,os
+          roots=[pathlib.Path('work-cpp/recovered')]+list(pathlib.Path('work-cpp').glob('format_*'))
+          dlls=[]
+          for r in roots:
+              if r.exists(): dlls += list(r.rglob('*.dll'))
+          rows=[]; target_names=['DAOImageService','DAOVideoService','DAODownloadService','DAONetService','DAOImageInfo','DAOVideoInfo','DAOImageData','DAOVideoData','DAOGameEntry','DAOSlideComponent']
+          for dll in dlls:
+              if dll.name.lower() not in {'assembly-csharp.dll','unitydaoframework.runtime.dll'}: continue
+              od=pathlib.Path('result-cpp/recovered-targets')/(dll.parent.name+'_'+dll.stem); od.mkdir(parents=True,exist_ok=True)
+              p=subprocess.run(['ilspycmd','-p','-o',str(od),str(dll)],capture_output=True,text=True,timeout=1800)
+              rows.append({'dll':str(dll),'bytes':dll.stat().st_size,'returncode':p.returncode,'stdout':p.stdout[-2000:],'stderr':p.stderr[-2000:]})
+          # Extract all target classes and all literal contexts from decompiled source.
+          hits=[]; literals=['.png','.download','ImageCache','temp_video.mp4','video.mp4','data_config.txt','ResourceUrl','CommonUrl','CheckUsereAttributes','USpecial1','is review']
+          for p in pathlib.Path('result-cpp/recovered-targets').rglob('*.cs'):
+              lines=p.read_text(errors='replace').splitlines()
+              if any(t.lower() in p.name.lower() or any(t.lower() in line.lower() for line in lines[:80]) for t in target_names):
+                  rel=p.relative_to('result-cpp/recovered-targets'); dst=pathlib.Path('result-cpp/target-csharp')/rel; dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(p,dst)
+              for n,line in enumerate(lines):
+                  if any(x.lower() in line.lower() for x in literals):
+                      hits.append({'file':str(p.relative_to('result-cpp/recovered-targets')),'line':n+1,'text':line.strip(),'context':'\n'.join(f'{i+1:06d}: {lines[i]}' for i in range(max(0,n-20),min(len(lines),n+35)))})
+          pathlib.Path('result-cpp/dll_inventory.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2))
+          pathlib.Path('result-cpp/literal_hits.json').write_text(json.dumps(hits,ensure_ascii=False,indent=2))
+          pathlib.Path('result-cpp/literal_hits.txt').write_text('\n\n'.join(f"=== {h['file']}:{h['line']} ===\n{h['context']}" for h in hits),encoding='utf-8')
+          PY
+
+      - name: Preserve non-DLL method outputs
+        run: |
+          mkdir -p result-cpp/format-outputs
+          find work-cpp -path 'work-cpp/format_*' -type f \( -name '*.txt' -o -name '*.json' -o -name '*.cs' \) -size -50M -exec cp --parents '{}' result-cpp/format-outputs/ \; || true
+
+      - name: Sanitize and package
+        if: always()
+        run: |
+          rm -rf work-cpp
+          find result-cpp -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.so' -o -name 'global-metadata.dat' \) -delete
+          printf '%s\n' "workflow=${GITHUB_WORKFLOW}" "run_id=${GITHUB_RUN_ID}" "sha=${GITHUB_SHA}" > result-cpp/github-run.txt
+          zip -r -9 cupids-arrow-cpp2il-results.zip result-cpp
+          sha256sum cupids-arrow-cpp2il-results.zip > cupids-arrow-cpp2il-results.zip.sha256
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-cpp2il-results
+          path: |
+            cupids-arrow-cpp2il-results.zip
+            cupids-arrow-cpp2il-results.zip.sha256
+            result-cpp/
+          compression-level: 0
+          retention-days: 7
