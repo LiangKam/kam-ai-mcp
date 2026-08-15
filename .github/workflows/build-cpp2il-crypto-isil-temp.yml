@@ -1,0 +1,49 @@
+name: TEMP Build Cpp2IL crypto ISIL target
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-cpp2il-crypto-isil-temp.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Clone and patch Cpp2IL
+        run: |
+          git clone --depth 1 --branch development https://github.com/SamboyCoding/Cpp2IL.git cpp2il-src
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('cpp2il-src/Cpp2IL.Core/OutputFormats/IsilDumpOutputFormat.cs')
+          s=p.read_text()
+          anchor='''                if (type.Methods.Count == 0)\n                    return;\n\n                var typeDump = new StringBuilder();'''
+          replacement='''                if (type.Methods.Count == 0)\n                    return;\n\n                var targetNames = new[]\n                {\n                    "EncryptionUtils", "DAOAsyncImageDownload", "ImageLoader",\n                    "DAOResourceLoaderComponentBase", "DAODownloadService",\n                    "DAOResourceLoaderData", "DAOPlayerService", "DAOImageService",\n                    "DAOVideoService", "PrivateImplementationDetails"\n                };\n                var fullName = type.Definition?.FullName ?? type.Name ?? string.Empty;\n                if (!targetNames.Any(n => fullName.Contains(n, StringComparison.OrdinalIgnoreCase)))\n                    return;\n\n                var typeDump = new StringBuilder();'''
+          if anchor not in s: raise SystemExit('anchor missing')
+          p.write_text(s.replace(anchor,replacement,1))
+          PY
+
+      - name: Build self-contained Linux binary
+        working-directory: cpp2il-src
+        run: |
+          dotnet restore -r linux-x64
+          dotnet publish ./Cpp2IL/Cpp2IL.csproj -c Release -f net10.0 -r linux-x64 --self-contained --no-restore -o ../target-cpp2il
+          chmod +x ../target-cpp2il/Cpp2IL
+          ../target-cpp2il/Cpp2IL --list-output-formats > ../target-cpp2il/output-formats.txt
+          sha256sum ../target-cpp2il/Cpp2IL > ../target-cpp2il/Cpp2IL.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cpp2IL-crypto-isil-linux-x64
+          path: target-cpp2il/
+          compression-level: 0
+          retention-days: 7
