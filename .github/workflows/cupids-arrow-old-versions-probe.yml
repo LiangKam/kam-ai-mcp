@@ -1,0 +1,172 @@
+name: Cupid Arrow old versions and embedded media probe
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-old-versions-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  old-versions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip file
+          python -m pip install requests
+
+      - name: Probe and download unique public version packages
+        run: |
+          cat > /tmp/old_probe.py <<'PY'
+          from __future__ import annotations
+          import base64,hashlib,json,os,pathlib,re,shutil,struct,time,urllib.parse,zipfile
+          import requests
+          ROOT=pathlib.Path('work-old'); PKG=ROOT/'packages'; EXT=ROOT/'extract'; OUT=pathlib.Path('old-result'); MEDIA=OUT/'embedded-media'
+          for p in (ROOT,PKG,EXT,OUT,MEDIA): p.mkdir(parents=True,exist_ok=True)
+          package='com.cupidarrow.arrowout.puzzle.gp'
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36','Accept':'*/*'})
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1024*1024),b''): h.update(b)
+              return h.hexdigest()
+          def strings(b):
+              a=[m.group().decode('ascii','replace') for m in re.finditer(rb'[\x20-\x7e]{5,}',b)]
+              a += [m.group().decode('utf-16le','replace') for m in re.finditer(rb'(?:[\x20-\x7e]\x00){5,}',b)]
+              return a
+          def dtype(b):
+              if b.startswith(b'\x89PNG\r\n\x1a\n'): return 'png'
+              if b.startswith(b'\xff\xd8\xff'): return 'jpg'
+              if b[:4]==b'RIFF' and b[8:12]==b'WEBP': return 'webp'
+              if len(b)>12 and b[4:8]==b'ftyp': return 'mp4'
+              if b.startswith(b'UnityFS'): return 'unityfs'
+              return 'other'
+          candidates=[]
+          for v,c in [('1.1.0','10'),('1.0.9','9'),('1.0.8','8'),('1.0.7','7'),('1.0.6','6'),('1.0.5','5')]:
+              for typ in ['XAPK','APK']:
+                  for q in [f'version={v}',f'versionCode={c}',f'version_code={c}']:
+                      candidates.append((f'apkpure_{typ}_{v}_{q.split("=")[0]}',f'https://d.apkpure.net/b/{typ}/{package}?{q}'))
+          candidates += [
+              ('apkdog_1.0.4','https://apk.dog/download?split=531311/3471604/cupid-s-arrow2'),
+              ('apkwatch_1.0.4','http://apk.watch/download?split=531311/3471604/cupid-s-arrow2'),
+          ]
+          probes=[]; finals={}; downloads=[]
+          # First resolve redirects using Range where possible, then download each unique final object once.
+          for label,url in candidates:
+              rec={'label':label,'url':url}
+              try:
+                  r=s.get(url,headers={'Range':'bytes=0-4095'},stream=True,timeout=(12,60),allow_redirects=True)
+                  chunk=b''
+                  for x in r.iter_content(4096): chunk+=x; break
+                  rec.update(status=r.status_code,final_url=r.url,headers=dict(r.headers),first_bytes_hex=chunk[:32].hex(),first_bytes_text=chunk[:300].decode('utf-8','replace'))
+                  if r.status_code in (200,206) and (chunk.startswith(b'PK\x03\x04') or 'winudf' in r.url or r.headers.get('content-type','').lower().find('application')>=0):
+                      finals.setdefault(r.url,[]).append(label)
+              except Exception as e: rec['error']=f'{type(e).__name__}: {e}'
+              probes.append(rec); print('PROBE',label,rec.get('status'),rec.get('final_url'),flush=True)
+          (OUT/'candidate_probe_results.json').write_text(json.dumps(probes,ensure_ascii=False,indent=2))
+          for idx,(url,labels) in enumerate(finals.items()):
+              target=PKG/f'package_{idx:02d}.bin'; rec={'labels':labels,'url':url,'target':str(target)}
+              try:
+                  with s.get(url,stream=True,timeout=(15,180),allow_redirects=True) as r:
+                      rec.update(status=r.status_code,final_url=r.url,headers=dict(r.headers)); total=0
+                      if r.status_code>=400: raise RuntimeError(f'HTTP {r.status_code}')
+                      with target.open('wb') as f:
+                          for chunk in r.iter_content(1024*1024):
+                              if chunk: f.write(chunk); total+=len(chunk)
+                      rec.update(bytes=total,sha256=sha(target),magic=target.read_bytes()[:4].hex())
+                      if not target.read_bytes()[:4].startswith(b'PK\x03\x04'): raise RuntimeError('not zip/apk/xapk')
+              except Exception as e: rec['error']=f'{type(e).__name__}: {e}'
+              downloads.append(rec); print('DOWNLOAD',labels,rec.get('status'),rec.get('bytes'),rec.get('error'),flush=True)
+          (OUT/'unique_package_downloads.json').write_text(json.dumps(downloads,ensure_ascii=False,indent=2))
+
+          inventories=[]; static_hits=[]; direct_media=[]
+          for idx,rec in enumerate(downloads):
+              target=pathlib.Path(rec['target'])
+              if rec.get('error') or not target.exists(): continue
+              xdir=EXT/f'package_{idx:02d}'; xdir.mkdir(parents=True,exist_ok=True)
+              try:
+                  with zipfile.ZipFile(target) as z: z.extractall(xdir)
+              except Exception:
+                  # A direct APK is also a ZIP; extraction above still normally succeeds.
+                  continue
+              apks=list(xdir.rglob('*.apk'))
+              if not apks and target.exists(): apks=[target]
+              pinv={'download_index':idx,'labels':rec['labels'],'archive_sha256':rec.get('sha256'),'archive_size':rec.get('bytes'),'apks':[]}
+              for ai,apk in enumerate(sorted(apks,key=lambda p:p.stat().st_size,reverse=True)):
+                  try:
+                      with zipfile.ZipFile(apk) as z:
+                          names=z.namelist(); manifest=None
+                          # XAPK manifest sits outside children; inspect any nearby manifest.json separately below.
+                          info={'name':str(apk),'size':apk.stat().st_size,'sha256':sha(apk),'entry_count':len(names),'has_metadata':any(n.endswith('global-metadata.dat') for n in names),'has_libil2cpp':any(n.endswith('libil2cpp.so') for n in names)}
+                          media=[]; selected=[]
+                          for n in names:
+                              low=n.lower()
+                              if low.endswith(('.mp4','.m3u8','.webm','.mov','.avi')): media.append(n)
+                              if n.endswith('assets/bin/Data/level0') or n.endswith('assets/d.ao_gp_assets.json') or n.endswith('assets/builddatas.json') or n.endswith('global-metadata.dat'):
+                                  selected.append(n)
+                          info['direct_video_entries']=media; info['selected_entries']=selected
+                          pinv['apks'].append(info)
+                          for n in selected:
+                              b=z.read(n)
+                              ss=strings(b)
+                              hits=[x for x in ss if any(k.lower() in x.lower() for k in ['drcupidarrow','dao_as/android','ResourceUrl','CommonUrl','OnlineUrl','CommoTestUrl','data_config','filter_attributes','review','assets_url','black_list'])]
+                              static_hits.append({'package_index':idx,'apk_index':ai,'entry':n,'sha256':hashlib.sha256(b).hexdigest(),'hits':hits})
+                          # Export only direct media entries, not APK files or SDK image resources.
+                          for n in media:
+                              b=z.read(n); k=dtype(b); sh=hashlib.sha256(b).hexdigest(); ext=pathlib.PurePosixPath(n).suffix.lower() or '.bin'
+                              out=MEDIA/f'p{idx:02d}_a{ai:02d}_{sh[:12]}{ext}'; out.write_bytes(b)
+                              direct_media.append({'package_index':idx,'apk_index':ai,'entry':n,'bytes':len(b),'sha256':sh,'detected_type':k,'saved':str(out)})
+                  except Exception as e:
+                      pinv['apks'].append({'name':str(apk),'error':str(e)})
+              # Inspect XAPK manifest/config for actual version values.
+              for mp in list(xdir.rglob('manifest.json'))+list(xdir.rglob('*.json')):
+                  if mp.stat().st_size>2_000_000: continue
+                  try:
+                      obj=json.loads(mp.read_text(errors='replace'))
+                      if isinstance(obj,dict) and any(k in obj for k in ['version_name','versionName','version_code','versionCode','xapk_version']):
+                          pinv.setdefault('package_manifests',[]).append({'path':str(mp),'data':obj})
+                  except: pass
+              inventories.append(pinv)
+          (OUT/'package_inventories.json').write_text(json.dumps(inventories,ensure_ascii=False,indent=2))
+          (OUT/'static_config_hits.json').write_text(json.dumps(static_hits,ensure_ascii=False,indent=2))
+          (OUT/'direct_video_media.json').write_text(json.dumps(direct_media,ensure_ascii=False,indent=2))
+          # Summarize unique package/version identities and URL roots.
+          roots=[]
+          for row in static_hits:
+              for h in row['hits']:
+                  for u in re.findall(r'https?://[^\s\"\'<>\\]+',h): roots.append(u.rstrip(')]},;'))
+          summary={'candidate_requests':len(candidates),'resolved_unique_final_urls':len(finals),'downloaded_archives':sum(1 for x in downloads if not x.get('error')),'inventories':len(inventories),'direct_video_files':len(direct_media),'unique_static_urls':sorted(set(roots))}
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2))
+          # Remove package and extracted APK inputs before upload.
+          shutil.rmtree(ROOT,ignore_errors=True)
+          PY
+          python /tmp/old_probe.py
+
+      - name: Package no-APK evidence
+        if: always()
+        run: |
+          find old-result -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.so' -o -name 'global-metadata.dat' \) -delete
+          printf '%s\n' "workflow=${GITHUB_WORKFLOW}" "run_id=${GITHUB_RUN_ID}" "sha=${GITHUB_SHA}" > old-result/github-run.txt
+          zip -r -9 cupids-arrow-old-versions-results.zip old-result
+          sha256sum cupids-arrow-old-versions-results.zip > cupids-arrow-old-versions-results.zip.sha256
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-old-versions-results
+          path: |
+            cupids-arrow-old-versions-results.zip
+            cupids-arrow-old-versions-results.zip.sha256
+            old-result/
+          compression-level: 0
+          retention-days: 7
