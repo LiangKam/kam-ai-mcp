@@ -1,0 +1,188 @@
+name: Cupid Arrow Unity asset version diff
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-unity-assets-version-diff.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  asset-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip file ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install UnityPy Pillow texture2ddecoder etcpak astc-encoder-py lz4 brotli
+
+      - name: Download and export v1.0.9 versus v1.1.0
+        run: |
+          mkdir -p work-assets result-assets
+          cat > /tmp/export_diff.py <<'PY'
+          from __future__ import annotations
+          import csv,hashlib,json,os,pathlib,re,shutil,subprocess,sys,urllib.parse,zipfile
+          import requests
+          from PIL import Image
+          import UnityPy
+
+          ROOT=pathlib.Path('work-assets'); OUT=pathlib.Path('result-assets'); UNIQUE=OUT/'v1.0.9_unique_media'; ALLMETA=OUT/'manifests'
+          for p in (ROOT,OUT,UNIQUE,ALLMETA): p.mkdir(parents=True,exist_ok=True)
+          S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 Chrome/151.0','Accept':'*/*'})
+          PKG='com.cupidarrow.arrowout.puzzle.gp'
+          versions=[('1.0.9','9'),('1.1.0','10')]
+          def sha_bytes(b): return hashlib.sha256(b).hexdigest()
+          def sha_file(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+          def safe(s): return re.sub(r'[^A-Za-z0-9._-]+','_',str(s)).strip('._')[:150] or 'unnamed'
+          def download(ver,code):
+              u=f'https://d.apkpure.net/b/XAPK/{PKG}?versionCode={code}'
+              r=S.get(u,timeout=(15,180),stream=True,allow_redirects=True); r.raise_for_status()
+              p=ROOT/f'{ver}.xapk'
+              with p.open('wb') as f:
+                  for c in r.iter_content(1024*1024):
+                      if c: f.write(c)
+              return p,r.url
+          def extract_base(xapk,ver):
+              xd=ROOT/f'xapk_{ver}'; xd.mkdir(exist_ok=True)
+              with zipfile.ZipFile(xapk) as z: z.extractall(xd)
+              apks=sorted(xd.rglob('*.apk'),key=lambda p:p.stat().st_size,reverse=True)
+              for apk in apks:
+                  with zipfile.ZipFile(apk) as z:
+                      if any(n.endswith('global-metadata.dat') for n in z.namelist()):
+                          ad=ROOT/f'apk_{ver}'; ad.mkdir(exist_ok=True); z.extractall(ad); return apk,ad
+              raise RuntimeError('base apk missing')
+          def decrypt_dat(src,dst):
+              b=src.read_bytes()
+              if b.startswith(b'UnityFS'): dst.write_bytes(b); return True,''
+              if len(b)<8: return False,''
+              target=b'UnityFS\x00'
+              # The shipped format uses a repeating four-byte XOR key. Derive it from known UnityFS magic.
+              key=bytes(b[i]^target[i] for i in range(4))
+              dec=bytes(v^key[i%4] for i,v in enumerate(b))
+              if dec.startswith(b'UnityFS'):
+                  dst.write_bytes(dec); return True,key.hex()
+              # Also test 8-byte repeating key from full known magic.
+              key8=bytes(b[i]^target[i] for i in range(min(8,len(target))))
+              dec=bytes(v^key8[i%len(key8)] for i,v in enumerate(b))
+              if dec.startswith(b'UnityFS'):
+                  dst.write_bytes(dec); return True,key8.hex()
+              return False,''
+          def export_version(ver,apk_dir):
+              work=ROOT/f'prepared_{ver}'; work.mkdir(exist_ok=True)
+              sources=[]; decrypt_rows=[]
+              for p in apk_dir.rglob('*'):
+                  if not p.is_file(): continue
+                  rel=p.relative_to(apk_dir)
+                  low=p.name.lower()
+                  if low.endswith('.dat'):
+                      out=work/(safe(str(rel))+'.bundle')
+                      ok,key=decrypt_dat(p,out); decrypt_rows.append({'source':str(rel),'ok':ok,'key':key,'bytes':p.stat().st_size})
+                      if ok: sources.append(out)
+                  elif 'assets/bin/Data' in p.as_posix() and (p.name.startswith('sharedassets') or p.name.startswith('globalgamemanagers') or p.name.startswith('level') or p.name in {'resources.assets','unity default resources'}):
+                      sources.append(p)
+              rows=[]; exported={}; errors=[]; raw_video=[]
+              temp=ROOT/f'exported_{ver}'; temp.mkdir(exist_ok=True)
+              for si,src in enumerate(sources):
+                  try: env=UnityPy.load(str(src))
+                  except Exception as e:
+                      errors.append({'source':str(src),'phase':'load','error':f'{type(e).__name__}: {e}'}); continue
+                  for obj in env.objects:
+                      typ=obj.type.name
+                      if typ not in {'Texture2D','Sprite','VideoClip','TextAsset','AudioClip'}: continue
+                      try: data=obj.read()
+                      except Exception as e:
+                          errors.append({'source':str(src),'path_id':obj.path_id,'type':typ,'phase':'read','error':f'{type(e).__name__}: {e}'}); continue
+                      name=getattr(data,'m_Name','') or getattr(data,'name','') or f'{typ}_{obj.path_id}'
+                      base={'version':ver,'source':str(src.relative_to(ROOT) if ROOT in src.parents else src),'source_index':si,'type':typ,'path_id':obj.path_id,'name':name}
+                      try:
+                          if typ in {'Texture2D','Sprite'}:
+                              img=getattr(data,'image',None)
+                              if img is None: raise ValueError('no image')
+                              if img.mode not in ('RGB','RGBA'): img=img.convert('RGBA')
+                              op=temp/f'{si:04d}_{typ}_{obj.path_id}_{safe(name)}.png'; img.save(op,'PNG',optimize=False)
+                              b=op.read_bytes(); h=sha_bytes(b); base.update({'exported':str(op),'sha256':h,'bytes':len(b),'width':img.width,'height':img.height})
+                              exported.setdefault(h,op)
+                          elif typ=='VideoClip':
+                              candidates=[]
+                              for attr in ['m_VideoData','video_data','m_VideoDataArray']:
+                                  v=getattr(data,attr,None)
+                                  if isinstance(v,(bytes,bytearray)) and v: candidates.append(bytes(v))
+                              # UnityPy may expose raw_data/export for VideoClip on some versions.
+                              for attr in ['raw_data','data']:
+                                  v=getattr(data,attr,None)
+                                  if isinstance(v,(bytes,bytearray)) and v: candidates.append(bytes(v))
+                              saved=[]
+                              for ci,b in enumerate(candidates):
+                                  ext='.mp4' if len(b)>12 and b[4:8]==b'ftyp' else '.bin'
+                                  op=temp/f'{si:04d}_VideoClip_{obj.path_id}_{safe(name)}_{ci}{ext}'; op.write_bytes(b); h=sha_bytes(b)
+                                  saved.append({'path':str(op),'sha256':h,'bytes':len(b),'magic':b[:16].hex()}); exported.setdefault(h,op)
+                              base.update({'video_candidates':saved,'resource':str(getattr(data,'m_ExternalResources',''))})
+                          elif typ=='TextAsset':
+                              script=getattr(data,'m_Script',b'')
+                              if isinstance(script,str): script=script.encode()
+                              if script:
+                                  h=sha_bytes(script); base.update({'sha256':h,'bytes':len(script),'preview':script[:500].decode('utf-8','replace')})
+                          elif typ=='AudioClip':
+                              samples=getattr(data,'samples',None)
+                              base.update({'audio_sample_keys':list(samples.keys()) if isinstance(samples,dict) else []})
+                          rows.append(base)
+                      except Exception as e:
+                          base.update({'export_error':f'{type(e).__name__}: {e}'}); rows.append(base)
+              (ALLMETA/f'{ver}_objects.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2,default=str))
+              (ALLMETA/f'{ver}_decrypt.json').write_text(json.dumps(decrypt_rows,ensure_ascii=False,indent=2))
+              (ALLMETA/f'{ver}_errors.json').write_text(json.dumps(errors,ensure_ascii=False,indent=2))
+              return rows,exported,temp
+          downloads=[]; versions_data={}
+          for ver,code in versions:
+              x,url=download(ver,code); apk,ad=extract_base(x,ver); rows,exports,temp=export_version(ver,ad)
+              versions_data[ver]=(rows,exports,temp)
+              downloads.append({'version':ver,'xapk_final_url':url,'xapk_bytes':x.stat().st_size,'xapk_sha256':sha_file(x),'base_name':apk.name,'base_bytes':apk.stat().st_size})
+          r9,e9,t9=versions_data['1.0.9']; r10,e10,t10=versions_data['1.1.0']
+          unique_hashes=sorted(set(e9)-set(e10)); common=set(e9)&set(e10)
+          copied=[]
+          for h in unique_hashes:
+              src=e9[h]; dst=UNIQUE/src.name
+              if dst.exists(): dst=UNIQUE/f'{h[:12]}_{src.name}'
+              shutil.copy2(src,dst); copied.append({'sha256':h,'source':str(src),'saved':str(dst),'bytes':dst.stat().st_size})
+          # Correlate unique hashes back to objects.
+          back=[]
+          for row in r9:
+              if row.get('sha256') in unique_hashes: back.append(row)
+          (OUT/'downloads.json').write_text(json.dumps(downloads,ensure_ascii=False,indent=2))
+          (OUT/'v1.0.9_unique_objects.json').write_text(json.dumps(back,ensure_ascii=False,indent=2,default=str))
+          (OUT/'v1.0.9_unique_files.json').write_text(json.dumps(copied,ensure_ascii=False,indent=2))
+          summary={'v1.0.9_objects':len(r9),'v1.1.0_objects':len(r10),'v1.0.9_exported_unique_hashes':len(e9),'v1.1.0_exported_unique_hashes':len(e10),'common_media_hashes':len(common),'v1.0.9_only_media_hashes':len(unique_hashes),'v1.0.9_only_bytes':sum(x['bytes'] for x in copied),'v1.0.9_video_objects':sum(1 for x in r9 if x['type']=='VideoClip'),'v1.1.0_video_objects':sum(1 for x in r10 if x['type']=='VideoClip'),'v1.0.9_video_candidates':sum(len(x.get('video_candidates',[])) for x in r9),'v1.1.0_video_candidates':sum(len(x.get('video_candidates',[])) for x in r10)}
+          (OUT/'SUMMARY.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2))
+          # Remove downloaded package archives and extracted APK trees before artifact upload.
+          shutil.rmtree(ROOT,ignore_errors=True)
+          PY
+          python /tmp/export_diff.py
+
+      - name: Package no-APK outputs
+        if: always()
+        run: |
+          find result-assets -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.so' -o -name 'global-metadata.dat' \) -delete
+          printf '%s\n' "workflow=${GITHUB_WORKFLOW}" "run_id=${GITHUB_RUN_ID}" "sha=${GITHUB_SHA}" > result-assets/github-run.txt
+          zip -r -9 cupids-arrow-unity-assets-version-diff.zip result-assets
+          sha256sum cupids-arrow-unity-assets-version-diff.zip > cupids-arrow-unity-assets-version-diff.zip.sha256
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-unity-assets-version-diff
+          path: |
+            cupids-arrow-unity-assets-version-diff.zip
+            cupids-arrow-unity-assets-version-diff.zip.sha256
+            result-assets/
+          compression-level: 0
+          retention-days: 7
