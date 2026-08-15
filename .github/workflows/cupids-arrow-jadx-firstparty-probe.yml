@@ -1,0 +1,110 @@
+name: Cupid Arrow JADX first-party network probe
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-jadx-firstparty-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jadx-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install
+        run: sudo apt-get update && sudo apt-get install -y unzip zip
+
+      - name: Download public XAPK and JADX
+        run: |
+          mkdir -p work-jadx/xapk work-jadx/base work-jadx/jadx jadx-result
+          curl -L --fail --retry 4 --retry-all-errors \
+            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?version=latest' \
+            -o work-jadx/current.xapk
+          unzip -q work-jadx/current.xapk -d work-jadx/xapk
+          python - <<'PY'
+          import pathlib,zipfile,shutil,json
+          apks=sorted(pathlib.Path('work-jadx/xapk').rglob('*.apk'),key=lambda p:p.stat().st_size,reverse=True)
+          base=None
+          for p in apks:
+              with zipfile.ZipFile(p) as z:
+                  if any(n.startswith('classes') and n.endswith('.dex') for n in z.namelist()) and any(n.endswith('global-metadata.dat') for n in z.namelist()):
+                      base=p; break
+          if base is None: raise SystemExit('base APK not found')
+          shutil.copy2(base,'work-jadx/base/base.apk')
+          pathlib.Path('jadx-result/input.json').write_text(json.dumps({'selected_base_name':base.name,'size':base.stat().st_size},indent=2))
+          PY
+          curl -L --fail --retry 4 --retry-all-errors \
+            'https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip' \
+            -o work-jadx/jadx.zip
+          unzip -q work-jadx/jadx.zip -d work-jadx/jadx
+
+      - name: Decompile and retain first-party code only
+        run: |
+          mkdir -p work-jadx/decompiled jadx-result/first-party jadx-result/search
+          work-jadx/jadx/bin/jadx \
+            --no-res \
+            --show-bad-code \
+            --deobf \
+            --deobf-min 2 \
+            --deobf-max 64 \
+            -j 4 \
+            -d work-jadx/decompiled \
+            work-jadx/base/base.apk \
+            > jadx-result/jadx.log 2>&1 || true
+          python - <<'PY'
+          import pathlib,re,shutil,json,collections
+          src=pathlib.Path('work-jadx/decompiled/sources'); dst=pathlib.Path('jadx-result/first-party')
+          prefixes=['com/dao/','com/arrowescape/','com/cupidarrow/']
+          copied=[]
+          for p in src.rglob('*.java'):
+              rel=p.relative_to(src).as_posix()
+              if any(rel.startswith(x) for x in prefixes):
+                  t=dst/rel; t.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(p,t); copied.append(rel)
+          terms=['OnVideoDownCallback','assets_url','black_list','b0c811ef5efb20ed','filter_attributes','launch_review_success','launch_review_fail','UserAB','FireBaseRemoteConfigData','temp_video.mp4','video.mp4','drcupidarrow','dao_as','download','RemoteConfig','UnitySendMessage','setServerUrl','ResourceUrl','review']
+          hits=[]
+          for p in dst.rglob('*.java'):
+              lines=p.read_text(errors='replace').splitlines()
+              for n,line in enumerate(lines):
+                  matched=[t for t in terms if t.lower() in line.lower()]
+                  if matched:
+                      hits.append({'file':str(p.relative_to(dst)),'line':n+1,'terms':matched,'text':line.strip(),'context':'\n'.join(f'{i+1:06d}: {lines[i]}' for i in range(max(0,n-12),min(len(lines),n+20)))})
+          pathlib.Path('jadx-result/search/search_hits.json').write_text(json.dumps(hits,ensure_ascii=False,indent=2),encoding='utf-8')
+          pathlib.Path('jadx-result/search/search_hits.txt').write_text('\n\n'.join(f"=== {h['file']}:{h['line']} {','.join(h['terms'])} ===\n{h['context']}" for h in hits),encoding='utf-8')
+          # Method/call inventory for the video callback and first-party HTTP/download classes.
+          focus=[]
+          for p in dst.rglob('*.java'):
+              text=p.read_text(errors='replace')
+              if any(x.lower() in text.lower() for x in ['OnVideoDownCallback','UnitySendMessage','HttpURLConnection','OkHttp','DownloadManager','FirebaseRemoteConfig','getString("assets_url','video.mp4','temp_video.mp4']):
+                  focus.append({'file':str(p.relative_to(dst)),'bytes':len(text.encode()),'class_declarations':re.findall(r'\b(?:class|interface|enum)\s+([A-Za-z0-9_$]+)',text),'methods':re.findall(r'\b(?:public|private|protected|static|final|synchronized|native|abstract|\s)+[\w<>\[\].?, ]+\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(',text)[:500]})
+          pathlib.Path('jadx-result/search/focus_classes.json').write_text(json.dumps(focus,ensure_ascii=False,indent=2),encoding='utf-8')
+          pathlib.Path('jadx-result/summary.json').write_text(json.dumps({'first_party_java_files':len(copied),'search_hits':len(hits),'focus_files':len(focus)},indent=2),encoding='utf-8')
+          PY
+
+      - name: Sanitize and package
+        if: always()
+        run: |
+          rm -rf work-jadx
+          find jadx-result -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.dex' -o -name '*.so' \) -delete
+          printf '%s\n' "workflow=${GITHUB_WORKFLOW}" "run_id=${GITHUB_RUN_ID}" "sha=${GITHUB_SHA}" > jadx-result/github-run.txt
+          zip -r -9 cupids-arrow-jadx-firstparty-results.zip jadx-result
+          sha256sum cupids-arrow-jadx-firstparty-results.zip > cupids-arrow-jadx-firstparty-results.zip.sha256
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-jadx-firstparty-results
+          path: |
+            cupids-arrow-jadx-firstparty-results.zip
+            cupids-arrow-jadx-firstparty-results.zip.sha256
+            jadx-result/
+          compression-level: 0
+          retention-days: 7
