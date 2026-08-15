@@ -1,0 +1,89 @@
+name: Cupid Arrow Unity asset version diff v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-unity-assets-version-diff-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  asset-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install extraction dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip file ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install requests UnityPy Pillow texture2ddecoder etcpak astc-encoder-py lz4 brotli
+
+      - name: Reuse reviewed extraction script from v1 workflow
+        run: |
+          mkdir -p work-assets result-assets
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('.github/workflows/cupids-arrow-unity-assets-version-diff.yml').read_text()
+          marker = "cat > /tmp/export_diff.py <<'PY'\n"
+          start = src.index(marker) + len(marker)
+          end = src.index("\n          PY\n          python /tmp/export_diff.py", start)
+          script = src[start:end]
+          # Remove the ten-space YAML block indentation from the embedded heredoc.
+          lines = script.splitlines()
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines) + '\n'
+          Path('/tmp/export_diff.py').write_text(script)
+          PY
+          python /tmp/export_diff.py
+
+      - name: Validate exported media
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+          import json, hashlib, subprocess
+          root=Path('result-assets')
+          rows=[]
+          for p in root.rglob('*'):
+              if not p.is_file(): continue
+              low=p.suffix.lower(); rec={'path':str(p),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+              if low in {'.png','.jpg','.jpeg','.webp'}:
+                  try:
+                      with Image.open(p) as im: rec.update(kind='image',width=im.width,height=im.height,format=im.format,valid=True)
+                  except Exception as e: rec.update(kind='image',valid=False,error=str(e))
+              elif low in {'.mp4','.m3u8','.webm'}:
+                  q=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration,format_name,size','-of','json',str(p)],capture_output=True,text=True)
+                  rec.update(kind='video',valid=q.returncode==0,ffprobe=q.stdout,error=q.stderr)
+              else: continue
+              rows.append(rec)
+          (root/'media_validation.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2))
+          (root/'media_validation_summary.json').write_text(json.dumps({'files':len(rows),'valid':sum(1 for r in rows if r.get('valid')),'images':sum(1 for r in rows if r.get('kind')=='image'),'videos':sum(1 for r in rows if r.get('kind')=='video')},indent=2))
+          PY
+
+      - name: Package no-APK results
+        if: always()
+        run: |
+          find result-assets -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.so' -o -name 'global-metadata.dat' \) -delete
+          printf '%s\n' "workflow=${GITHUB_WORKFLOW}" "run_id=${GITHUB_RUN_ID}" "sha=${GITHUB_SHA}" > result-assets/github-run.txt
+          zip -r -9 cupids-arrow-unity-assets-version-diff-v2.zip result-assets
+          sha256sum cupids-arrow-unity-assets-version-diff-v2.zip > cupids-arrow-unity-assets-version-diff-v2.zip.sha256
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-unity-assets-version-diff-v2
+          path: |
+            cupids-arrow-unity-assets-version-diff-v2.zip
+            cupids-arrow-unity-assets-version-diff-v2.zip.sha256
+            result-assets/
+          compression-level: 0
+          retention-days: 7
