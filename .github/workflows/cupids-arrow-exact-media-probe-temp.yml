@@ -1,0 +1,202 @@
+name: TEMP Cupid Arrow exact media probe
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-exact-media-probe-temp.yml'
+      - 'tmp/cupids-arrow-probe-candidates.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe reconstructed media keys
+        run: |
+          mkdir -p result/valid_media
+          python - <<'PY'
+          from __future__ import annotations
+          import concurrent.futures as cf
+          import csv, hashlib, json, os, pathlib, ssl, time, urllib.error, urllib.request
+          from dataclasses import dataclass, asdict
+          from typing import Iterable
+
+          ROOTS = [
+              'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/',
+              'https://drcupidarrow.com/dao_as/android/v_1_0_0_AS/',
+          ]
+          UA = 'UnityPlayer/2022.3.62f3 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)'
+          candidates = json.loads(pathlib.Path('tmp/cupids-arrow-probe-candidates.json').read_text())
+          out_root = pathlib.Path('result')
+          media_root = out_root / 'valid_media'
+          media_root.mkdir(parents=True, exist_ok=True)
+          ctx = ssl.create_default_context()
+
+          def emge_digest(text: str) -> str:
+              # Reconstructed legacy variant: skip byte 0, lower x2 hex, reverse characters.
+              b = hashlib.md5(text.encode('utf-8')).digest()
+              return ''.join(f'{x:02x}' for x in b[1:])[::-1]
+
+          def digest_variants(logical: str) -> list[tuple[str,str]]:
+              md5 = hashlib.md5(logical.encode('utf-8')).hexdigest()
+              raw = hashlib.md5(logical.encode('utf-8')).digest()
+              return [
+                  ('md5', md5),
+                  ('md5_reverse_chars', md5[::-1]),
+                  ('md5_reverse_bytes', raw[::-1].hex()),
+                  ('emge_skip0_reverse_chars', emge_digest(logical)),
+              ]
+
+          probes=[]
+          seen=set()
+          for c in candidates:
+              group=str(c['group'])
+              key=str(c.get('name') or c['id'])
+              # All four are produced by OCBFFLPIFGJ boolean combinations.
+              for kind, ext in [('L','jpg'),('S','jpg'),('V','mp4'),('SV','mp4')]:
+                  logical=f'assets/{group}/{kind}/{key}.{ext}'
+                  for variant,digest in digest_variants(logical):
+                      for root in ROOTS:
+                          url=f'{root}assets/{group}/{kind}/{digest}.{ext}'
+                          k=(url,variant)
+                          if k in seen: continue
+                          seen.add(k)
+                          probes.append({
+                              'id':str(c['id']), 'key':key, 'group':group, 'kind':kind,
+                              'ext':ext, 'root':root, 'logical_path':logical,
+                              'hash_variant':variant, 'digest':digest, 'url':url
+                          })
+
+          def magic_type(data: bytes) -> str:
+              if data.startswith(b'\xff\xd8\xff'): return 'jpeg'
+              if data.startswith(b'\x89PNG\r\n\x1a\n'): return 'png'
+              if data.startswith(b'RIFF') and data[8:12]==b'WEBP': return 'webp'
+              if len(data)>=12 and data[4:8]==b'ftyp': return 'mp4'
+              if data.startswith(b'#EXTM3U'): return 'hls'
+              if data.startswith(b'{') or data.startswith(b'['): return 'json'
+              if b'<Error>' in data[:2048] or b'NoSuchKey' in data[:2048]: return 'tos_error'
+              if data.lstrip().startswith(b'<'): return 'html_or_xml'
+              return 'unknown'
+
+          def request_prefix(p: dict) -> dict:
+              started=time.time()
+              req=urllib.request.Request(p['url'], headers={
+                  'User-Agent':UA,
+                  'Accept':'*/*',
+                  'Range':'bytes=0-65535',
+                  'Connection':'close',
+              })
+              row=dict(p)
+              row.update({'status':None,'final_url':p['url'],'content_type':'','content_length':'',
+                          'content_range':'','etag':'','x_tos_request_id':'','prefix_bytes':0,
+                          'prefix_sha256':'','magic':'','body_preview':'','error':'','elapsed_ms':0})
+              try:
+                  with urllib.request.urlopen(req, timeout=18, context=ctx) as r:
+                      data=r.read(65536)
+                      row.update({
+                          'status':getattr(r,'status',None),
+                          'final_url':r.geturl(),
+                          'content_type':r.headers.get('Content-Type',''),
+                          'content_length':r.headers.get('Content-Length',''),
+                          'content_range':r.headers.get('Content-Range',''),
+                          'etag':r.headers.get('ETag',''),
+                          'x_tos_request_id':r.headers.get('x-tos-request-id','') or r.headers.get('x-tos-requestid',''),
+                          'prefix_bytes':len(data),
+                          'prefix_sha256':hashlib.sha256(data).hexdigest(),
+                          'magic':magic_type(data),
+                          'body_preview':data[:300].decode('utf-8','replace').replace('\r','\\r').replace('\n','\\n')
+                      })
+              except urllib.error.HTTPError as e:
+                  data=e.read(4096)
+                  row.update({
+                      'status':e.code,'final_url':e.geturl(),
+                      'content_type':e.headers.get('Content-Type',''),
+                      'content_length':e.headers.get('Content-Length',''),
+                      'etag':e.headers.get('ETag',''),
+                      'x_tos_request_id':e.headers.get('x-tos-request-id','') or e.headers.get('x-tos-requestid',''),
+                      'prefix_bytes':len(data),'prefix_sha256':hashlib.sha256(data).hexdigest(),
+                      'magic':magic_type(data),
+                      'body_preview':data[:300].decode('utf-8','replace').replace('\r','\\r').replace('\n','\\n'),
+                      'error':f'HTTPError:{e.code}'
+                  })
+              except Exception as e:
+                  row['error']=f'{type(e).__name__}:{e}'
+              row['elapsed_ms']=round((time.time()-started)*1000)
+              return row
+
+          print('probe_count',len(probes),flush=True)
+          rows=[]
+          with cf.ThreadPoolExecutor(max_workers=36) as ex:
+              futures=[ex.submit(request_prefix,p) for p in probes]
+              for i,f in enumerate(cf.as_completed(futures),1):
+                  row=f.result(); rows.append(row)
+                  if row['magic'] in {'jpeg','png','webp','mp4','hls'} or row['status'] in {200,206}:
+                      print('POTENTIAL',row['status'],row['magic'],row['url'],flush=True)
+                  if i%250==0: print('progress',i,'/',len(probes),flush=True)
+
+          rows.sort(key=lambda r:(r['id'],r['kind'],r['root'],r['hash_variant']))
+          pathlib.Path('result/probe_results.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2))
+          fields=list(rows[0].keys()) if rows else []
+          with open('result/probe_results.csv','w',newline='',encoding='utf-8-sig') as f:
+              w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+
+          valid=[r for r in rows if r['magic'] in {'jpeg','png','webp','mp4','hls'} and r['status'] in {200,206}]
+          # A status-200 error XML is not valid because magic is checked above.
+          downloads=[]
+          for r in valid:
+              req=urllib.request.Request(r['url'],headers={'User-Agent':UA,'Accept':'*/*'})
+              d=dict(r)
+              try:
+                  with urllib.request.urlopen(req,timeout=90,context=ctx) as resp:
+                      data=resp.read()
+                  m=magic_type(data)
+                  if m not in {'jpeg','png','webp','mp4','hls'}:
+                      raise RuntimeError('full body magic changed to '+m)
+                  version='v101' if 'v_1_0_1_AS' in r['root'] else 'v100'
+                  rel=pathlib.Path(version)/r['group']/r['kind']/(r['id']+'__'+r['hash_variant']+'__'+r['digest']+'.'+r['ext'])
+                  dest=media_root/rel; dest.parent.mkdir(parents=True,exist_ok=True); dest.write_bytes(data)
+                  d.update({'saved_path':str(dest),'full_bytes':len(data),'full_sha256':hashlib.sha256(data).hexdigest(),'full_magic':m,'download_error':''})
+              except Exception as e:
+                  d.update({'saved_path':'','full_bytes':0,'full_sha256':'','full_magic':'','download_error':f'{type(e).__name__}:{e}'})
+              downloads.append(d)
+
+          pathlib.Path('result/valid_downloads.json').write_text(json.dumps(downloads,ensure_ascii=False,indent=2))
+          if downloads:
+              with open('result/valid_downloads.csv','w',newline='',encoding='utf-8-sig') as f:
+                  w=csv.DictWriter(f,fieldnames=list(downloads[0].keys())); w.writeheader(); w.writerows(downloads)
+
+          from collections import Counter
+          summary={
+              'candidate_count':len(candidates),'probe_count':len(probes),
+              'status_counts':dict(Counter(str(r['status']) for r in rows)),
+              'magic_counts':dict(Counter(r['magic'] for r in rows)),
+              'valid_prefix_hits':len(valid),'full_download_records':len(downloads),
+              'valid_saved_files':sum(1 for d in downloads if d.get('saved_path')),
+              'roots':ROOTS,
+          }
+          pathlib.Path('result/summary.json').write_text(json.dumps(summary,indent=2))
+          print(json.dumps(summary,indent=2),flush=True)
+          PY
+
+      - name: Package
+        if: always()
+        run: |
+          zip -r -9 cupids-arrow-exact-media-probe.zip result
+          sha256sum cupids-arrow-exact-media-probe.zip > cupids-arrow-exact-media-probe.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cupids-arrow-exact-media-probe
+          path: |
+            cupids-arrow-exact-media-probe.zip
+            cupids-arrow-exact-media-probe.zip.sha256
+            result/
+          compression-level: 0
+          retention-days: 7
