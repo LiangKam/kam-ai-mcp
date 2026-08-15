@@ -1,0 +1,42 @@
+name: Cupid Arrow Firebase client probe
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-firebase-probe.yml'
+      - 'tools/cupids_arrow_firebase_probe.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  firebase-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: python -m pip install requests
+      - name: Fetch client Remote Config and discovered resources
+        env:
+          FRC_OUT: firebase-probe-output
+          PYTHONUNBUFFERED: '1'
+        run: python tools/cupids_arrow_firebase_probe.py
+      - name: Package
+        if: always()
+        run: |
+          mkdir -p firebase-probe-output
+          zip -r -9 cupids-arrow-firebase-probe-results.zip firebase-probe-output
+          sha256sum cupids-arrow-firebase-probe-results.zip > cupids-arrow-firebase-probe-results.zip.sha256
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-firebase-probe-results
+          path: |
+            cupids-arrow-firebase-probe-results.zip
+            cupids-arrow-firebase-probe-results.zip.sha256
+            firebase-probe-output/
+          compression-level: 0
+          retention-days: 7
