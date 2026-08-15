@@ -1,0 +1,56 @@
+name: Build target-filtered Cpp2IL DLL recovery
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-cpp2il-target-dll.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Clone and patch Cpp2IL IL recovery to target classes only
+        run: |
+          git clone --depth 1 --branch development https://github.com/SamboyCoding/Cpp2IL.git cpp2il-src
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('cpp2il-src/Cpp2IL.Core/OutputFormats/AsmResolverDllOutputFormatIlRecovery.cs')
+          s=p.read_text()
+          anchor='''        if (!methodDefinition.IsManagedMethodWithBody())\n            return;\n\n        methodDefinition.CilMethodBody = new();'''
+          replacement='''        if (!methodDefinition.IsManagedMethodWithBody())\n            return;\n\n        var targetNames = new[]\n        {\n            "DAOImageService", "DAOVideoService", "DAODownloadService",\n            "DAOResourceLoaderComponentBase", "DAONetService", "DAOCheckDAONetService",\n            "DAONetConfig", "NetConfigs", "DAOImageInfo", "DAOVideoInfo",\n            "DAOImageData", "DAOVideoData", "DAOVideoDataList",\n            "DAOImageForm", "DAOVideoForm", "DAOImageLoader", "DAOVideoLoader",\n            "DAOSlideComponent", "DAOGameEntry", "PlatformComponentBase",\n            "CheckUsereAttributes", "UsereAttributes"\n        };\n        var declaringTypeName = methodContext.DeclaringType?.FullName ?? string.Empty;\n        var shouldAnalyzeTarget = targetNames.Any(n => declaringTypeName.Contains(n, StringComparison.OrdinalIgnoreCase));\n\n        methodDefinition.CilMethodBody = new();'''
+          if anchor not in s:
+              raise SystemExit('IL recovery patch anchor not found')
+          s=s.replace(anchor,replacement,1)
+          anchor2='''        if (shouldSkip)\n        {\n            FillMethodBodyWithStub(methodDefinition);\n            return;\n        }'''
+          replacement2='''        if (shouldSkip || !shouldAnalyzeTarget)\n        {\n            FillMethodBodyWithStub(methodDefinition);\n            return;\n        }'''
+          if anchor2 not in s:
+              raise SystemExit('skip patch anchor not found')
+          p.write_text(s.replace(anchor2,replacement2,1))
+          PY
+
+      - name: Build self-contained Linux binary
+        working-directory: cpp2il-src
+        run: |
+          dotnet restore -r linux-x64
+          dotnet publish ./Cpp2IL/Cpp2IL.csproj -c Release -f net10.0 -r linux-x64 --self-contained --no-restore -o ../target-cpp2il-dll
+          chmod +x ../target-cpp2il-dll/Cpp2IL
+          ../target-cpp2il-dll/Cpp2IL --list-output-formats > ../target-cpp2il-dll/output-formats.txt
+          sha256sum ../target-cpp2il-dll/Cpp2IL > ../target-cpp2il-dll/Cpp2IL.sha256
+
+      - name: Upload target-filtered binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cpp2IL-target-dll-linux-x64
+          path: target-cpp2il-dll/
+          compression-level: 0
+          retention-days: 7
