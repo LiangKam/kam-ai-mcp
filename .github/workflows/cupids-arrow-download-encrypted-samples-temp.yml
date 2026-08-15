@@ -1,0 +1,56 @@
+name: TEMP Cupid Arrow download encrypted samples
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-download-encrypted-samples-temp.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download exact objects
+        run: |
+          mkdir -p result/encrypted
+          python - <<'PY'
+          import hashlib,json,pathlib,urllib.request
+          urls={
+            '1010001_L.jpg.enc':'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/assets/LVGP/L/a1f4b17094d782b6a0e10109b1df0630.jpg',
+            '1010001_S.jpg.enc':'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/assets/LVGP/S/75d4c60018470064ff0c5d8e3e691cdf.jpg',
+            '1010002_L.jpg.enc':'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/assets/LVGP/L/ad2c64fc53e13d01442ea0e886c7aa84.jpg',
+            '1010002_S.jpg.enc':'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/assets/LVGP/S/9f0a9d9f56f05e24977de03742247ef8.jpg',
+            '1010003_L.jpg.enc':'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/assets/LVGP/L/5482b74c3d7ad2e3cab41a8236170623.jpg',
+            '1010003_S.jpg.enc':'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/assets/LVGP/S/2d5a906a97e0be4c4302d53406e441bb.jpg',
+            '2050101_V.mp4.enc':'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/assets/CHAPTER/V/d5b63cde31eb298c529e95715a0e9c09.mp4',
+            '2050102_V.mp4.enc':'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/assets/CHAPTER/V/3f214cde1245cf970b83981895309591.mp4',
+            '2050201_V.mp4.enc':'https://drcupidarrow.com/dao_as/android/v_1_0_1_AS/assets/CHAPTER/V/bd2a572210d304fa56a3432061e048b3.mp4',
+          }
+          rows=[]
+          ua='UnityPlayer/2022.3.62f3 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)'
+          for name,url in urls.items():
+              req=urllib.request.Request(url,headers={'User-Agent':ua,'Accept':'*/*'})
+              with urllib.request.urlopen(req,timeout=120) as r:
+                  data=r.read(); headers=dict(r.headers.items())
+              dest=pathlib.Path('result/encrypted')/name; dest.write_bytes(data)
+              rows.append({'name':name,'url':url,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'md5':hashlib.md5(data).hexdigest(),'first64_hex':data[:64].hex(),'content_type':headers.get('Content-Type',''),'etag':headers.get('ETag','')})
+          pathlib.Path('result/inventory.json').write_text(json.dumps(rows,indent=2))
+          PY
+          file result/encrypted/* > result/file.txt
+          sha256sum result/encrypted/* > result/sha256.txt
+          zip -r -9 cupids-arrow-encrypted-samples.zip result
+          sha256sum cupids-arrow-encrypted-samples.zip > cupids-arrow-encrypted-samples.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-encrypted-samples
+          path: |
+            cupids-arrow-encrypted-samples.zip
+            cupids-arrow-encrypted-samples.zip.sha256
+            result/
+          compression-level: 0
+          retention-days: 7
