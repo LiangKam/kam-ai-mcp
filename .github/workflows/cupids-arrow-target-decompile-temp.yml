@@ -29,32 +29,58 @@ jobs:
       - name: Download and extract current public package
         run: |
           mkdir -p work/xapk work/base result
-          curl -L --fail --retry 5 --retry-all-errors \
-            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?version=latest' \
-            -o work/current.xapk
+          set +e
+          for URL in \
+            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?versionCode=10' \
+            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?version=latest'; do
+            echo "Trying $URL"
+            rm -f work/current.xapk
+            curl -L --fail --retry 5 --retry-all-errors "$URL" -o work/current.xapk
+            python - <<'PY'
+          import pathlib,zipfile,sys
+          p=pathlib.Path('work/current.xapk')
+          try:
+              with zipfile.ZipFile(p) as z:
+                  print('download_ok',p.stat().st_size,'entries',len(z.namelist()))
+              sys.exit(0)
+          except Exception as e:
+              print('invalid_archive',repr(e)); sys.exit(1)
+          PY
+            if [ $? -eq 0 ]; then break; fi
+          done
+          set -e
           unzip -q work/current.xapk -d work/xapk
           python - <<'PY'
           import pathlib, zipfile, json, hashlib
           root=pathlib.Path('work/xapk')
           apks=sorted(root.rglob('*.apk'), key=lambda p:p.stat().st_size, reverse=True)
+          # Some APKPure responses are a monolithic APK wrapped as XAPK; others contain split APKs.
+          if not apks and zipfile.is_zipfile('work/current.xapk'):
+              apks=[pathlib.Path('work/current.xapk')]
           base=None; split=None; lib_name=None
+          inventory=[]
           for p in apks:
               with zipfile.ZipFile(p) as z:
                   names=z.namelist()
-                  if base is None and any(n.endswith('global-metadata.dat') for n in names):
+                  has_meta=any(n.endswith('global-metadata.dat') for n in names)
+                  libs=[n for n in names if n.endswith('/libil2cpp.so') or n=='libil2cpp.so']
+                  libs.sort(key=lambda n:(0 if 'arm64-v8a' in n else 1, n))
+                  inventory.append({'file':str(p),'bytes':p.stat().st_size,'has_metadata':has_meta,'libil2cpp':libs})
+                  if base is None and has_meta:
                       base=p
-                  arm=[n for n in names if n.endswith('lib/arm64-v8a/libil2cpp.so') or n=='lib/arm64-v8a/libil2cpp.so']
-                  if split is None and arm:
-                      split=p; lib_name=arm[0]
-          if not base or not split:
-              raise SystemExit(f'package pair missing: base={base}, split={split}')
+                  if split is None and libs:
+                      split=p; lib_name=libs[0]
+          pathlib.Path('result/package_inventory.json').write_text(json.dumps(inventory,indent=2))
+          if not base or not split or not lib_name:
+              raise SystemExit(f'package pair missing: base={base}, split={split}, lib={lib_name}; inventory={inventory}')
           with zipfile.ZipFile(base) as z: z.extractall('work/base')
+          # Works whether libil2cpp is in the same APK or in a split.
           with zipfile.ZipFile(split) as z: z.extract(lib_name,'work/base')
           meta=next(pathlib.Path('work/base').rglob('global-metadata.dat'))
           lib=pathlib.Path('work/base')/lib_name
           def sha(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
           pathlib.Path('result/input.json').write_text(json.dumps({
-              'base_apk':base.name,'arm64_split':split.name,
+              'base_apk':base.name,'lib_source_apk':split.name,'lib_entry':lib_name,
               'metadata':str(meta),'lib':str(lib),
               'metadata_sha256':sha(meta),'lib_sha256':sha(lib),
               'xapk_bytes':pathlib.Path('work/current.xapk').stat().st_size
