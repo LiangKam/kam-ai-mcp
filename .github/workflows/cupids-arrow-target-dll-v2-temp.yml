@@ -1,0 +1,147 @@
+name: TEMP Cupid Arrow target DLL recovery v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-target-dll-v2-temp.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip jq file
+          dotnet tool install --global ilspycmd
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: Build corrected type-filtered Cpp2IL
+        run: |
+          mkdir -p work result
+          git clone --depth 1 --branch development https://github.com/SamboyCoding/Cpp2IL.git work/src
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('work/src/Cpp2IL.Core/OutputFormats/AsmResolverDllOutputFormatIlRecovery.cs')
+          s=p.read_text()
+          old='''        if (!methodDefinition.IsManagedMethodWithBody())\n            return;\n\n        methodDefinition.CilMethodBody = new();'''
+          new='''        if (!methodDefinition.IsManagedMethodWithBody())\n            return;\n\n        var targetNames = new[]\n        {\n            "DAOImageService", "DAOVideoService", "DAODownloadService",\n            "DAOResourceLoaderComponentBase", "DAONetService", "DAOCheckDAONetService",\n            "DAOConfigComponent", "DAONetConfig", "NetConfigs", "DAOImageInfo",\n            "DAOVideoInfo", "DAOImageData", "DAOVideoData", "DAOVideoDataList",\n            "DAOImageForm", "DAOVideoForm", "DAOImageLoader", "DAOVideoLoader",\n            "DAOSlideComponent", "DAOGameEntry", "GameEntry", "PlatformComponentBase",\n            "CheckUsereAttributes", "UsereAttributes", "PrivateImplementationDetails"\n        };\n        var declaringTypeName = methodDefinition.DeclaringType?.FullName ?? methodContext.FullName;\n        var shouldAnalyzeTarget = targetNames.Any(n => declaringTypeName.Contains(n, StringComparison.OrdinalIgnoreCase));\n\n        methodDefinition.CilMethodBody = new();'''
+          if old not in s: raise SystemExit('first patch anchor missing')
+          s=s.replace(old,new,1)
+          old2='''        if (shouldSkip)\n        {\n            FillMethodBodyWithStub(methodDefinition);\n            return;\n        }'''
+          new2='''        if (shouldSkip || !shouldAnalyzeTarget)\n        {\n            FillMethodBodyWithStub(methodDefinition);\n            return;\n        }\n\n        Logger.InfoNewline($"TARGET_IL {declaringTypeName}::{methodDefinition.Name}");'''
+          if old2 not in s: raise SystemExit('second patch anchor missing')
+          p.write_text(s.replace(old2,new2,1))
+          PY
+          cd work/src
+          dotnet restore -r linux-x64
+          dotnet publish ./Cpp2IL/Cpp2IL.csproj -c Release -f net10.0 -r linux-x64 \
+            --self-contained --no-restore -o ../tool
+          chmod +x ../tool/Cpp2IL
+
+      - name: Download and extract package
+        run: |
+          mkdir -p work/xapk work/base
+          for URL in \
+            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?versionCode=10' \
+            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?version=latest'; do
+            rm -f work/current.xapk
+            curl -L --fail --retry 5 --retry-all-errors "$URL" -o work/current.xapk || true
+            unzip -tq work/current.xapk >/dev/null 2>&1 && break
+          done
+          unzip -q work/current.xapk -d work/xapk
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile,json,hashlib
+          root=Path('work/xapk'); apks=sorted(root.rglob('*.apk'),key=lambda p:p.stat().st_size,reverse=True)
+          if not apks: apks=[Path('work/current.xapk')]
+          base=libapk=libname=None; inv=[]
+          for p in apks:
+              with zipfile.ZipFile(p) as z:
+                  ns=z.namelist(); has_meta=any(n.endswith('global-metadata.dat') for n in ns)
+                  libs=sorted([n for n in ns if n.endswith('/libil2cpp.so') or n=='libil2cpp.so'],key=lambda n:(0 if 'arm64-v8a' in n else 1,n))
+                  inv.append({'file':str(p),'bytes':p.stat().st_size,'metadata':has_meta,'libs':libs})
+                  if base is None and has_meta: base=p
+                  if libapk is None and libs: libapk=p; libname=libs[0]
+          Path('result/package-inventory.json').write_text(json.dumps(inv,indent=2))
+          if not base or not libapk: raise SystemExit(str(inv))
+          with zipfile.ZipFile(base) as z:z.extractall('work/base')
+          with zipfile.ZipFile(libapk) as z:z.extract(libname,'work/base')
+          meta=next(Path('work/base').rglob('global-metadata.dat')); lib=Path('work/base')/libname
+          Path('work/meta.txt').write_text(str(meta.resolve())); Path('work/lib.txt').write_text(str(lib.resolve()))
+          h=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          Path('result/input.json').write_text(json.dumps({'base':base.name,'lib_source':libapk.name,'lib_entry':libname,'metadata_sha256':h(meta),'lib_sha256':h(lib)},indent=2))
+          PY
+
+      - name: Recover selected methods
+        run: |
+          export NO_COLOR=true
+          work/tool/Cpp2IL \
+            --force-binary-path="$(cat work/lib.txt)" \
+            --force-metadata-path="$(cat work/meta.txt)" \
+            --force-unity-version=2022.3.62f3 \
+            --output-as=dll_il_recovery \
+            --output-to="$(pwd)/work/recovered" \
+            --verbose > result/cpp2il.log 2>&1
+          grep 'TARGET_IL' result/cpp2il.log > result/selected-methods.txt || true
+          grep -E 'successfully decompiled|Outputting assembly|Finished' result/cpp2il.log | tail -100 > result/recovery-summary.txt || true
+
+      - name: Decompile and verify non-stub bodies
+        run: |
+          mkdir -p result/decompiled
+          for DLL in work/recovered/AssemblyCSharp.dll work/recovered/Assembly-CSharp.dll work/recovered/UnityDAOFramework.Runtime.dll work/recovered/TheVayuputra.dll; do
+            [ -f "$DLL" ] || continue
+            N=$(basename "$DLL" .dll)
+            ilspycmd -p -o "result/decompiled/$N" "$DLL" > "result/ilspy_$N.log" 2>&1
+          done
+          python - <<'PY'
+          from pathlib import Path
+          import json,re,shutil,hashlib
+          root=Path('result/decompiled'); out=Path('result/targets'); out.mkdir(parents=True,exist_ok=True)
+          names=['DAOImageService','DAOVideoService','DAODownloadService','DAOResourceLoaderComponentBase','DAONetService','DAOCheckDAONetService','DAOConfigComponent','NetConfigs','DAOImageInfo','DAOVideoInfo','DAOImageData','DAOVideoData','DAOVideoDataList','DAOImageForm','DAOVideoForm','DAOSlideComponent','GameEntry','PlatformComponentBase','UsereAttributes','PrivateImplementationDetails']
+          rows=[]
+          for p in root.rglob('*.cs'):
+              txt=p.read_text(errors='replace')
+              if any(n.lower() in p.name.lower() or n.lower() in txt[:5000].lower() for n in names):
+                  rel=p.relative_to(root); d=out/rel; d.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(p,d)
+                  rows.append({'file':str(rel),'bytes':p.stat().st_size,'return_null':txt.count('return null;'),'return_false':txt.count('return false;'),'string_concat':txt.count('string.Concat'),'format':txt.count('string.Format'),'md5':txt.lower().count('md5'),'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+          Path('result/target-analysis.json').write_text(json.dumps(rows,indent=2))
+          pats=['.png','.download','data_config','ResourceUrl','CommonUrl','temp_video','video.mp4','MD5','GetHashCode','ComputeStringHash','DiskCachePath','PreDownload','StartOnDownloadRes','CheckUsereAttributes','is review','USpecial1','string.Concat','string.Format']
+          hits=[]
+          for p in out.rglob('*.cs'):
+              ls=p.read_text(errors='replace').splitlines()
+              for i,l in enumerate(ls):
+                  if any(x.lower() in l.lower() for x in pats):
+                      hits.append({'file':str(p.relative_to(out)),'line':i+1,'text':l.strip(),'context':'\n'.join(f'{j+1:06d}: {ls[j]}' for j in range(max(0,i-30),min(len(ls),i+60)))})
+          Path('result/path-hits.json').write_text(json.dumps(hits,ensure_ascii=False,indent=2))
+          Path('result/path-hits.txt').write_text('\n\n'.join(f"=== {h['file']}:{h['line']} ===\n{h['context']}" for h in hits),encoding='utf-8')
+          PY
+
+      - name: Sanitize and upload
+        if: always()
+        run: |
+          rm -rf work
+          find result -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.so' -o -name 'global-metadata.dat' -o -name '*.dll' \) -delete
+          zip -r -9 cupids-arrow-target-dll-v2.zip result
+          sha256sum cupids-arrow-target-dll-v2.zip > cupids-arrow-target-dll-v2.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cupids-arrow-target-dll-v2
+          path: |
+            cupids-arrow-target-dll-v2.zip
+            cupids-arrow-target-dll-v2.zip.sha256
+            result/
+          compression-level: 0
+          retention-days: 7
