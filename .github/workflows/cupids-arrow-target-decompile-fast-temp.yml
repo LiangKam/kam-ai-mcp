@@ -1,0 +1,144 @@
+name: TEMP Cupid Arrow fast target decompile
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-target-decompile-fast-temp.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Install and obtain prebuilt target Cpp2IL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip jq file
+          dotnet tool install --global ilspycmd
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          mkdir -p work/tool result
+          gh run download 31872706448 -R LiangKam/kam-ai-mcp \
+            -n Cpp2IL-target-dll-linux-x64 -D work/tool
+          TOOL=$(find work/tool -type f -name Cpp2IL | head -1)
+          test -n "$TOOL"
+          chmod +x "$TOOL"
+          echo "$(realpath "$TOOL")" > work/tool_path.txt
+          "$TOOL" --list-output-formats > result/output-formats.txt
+
+      - name: Download and identify current package pair
+        run: |
+          mkdir -p work/xapk work/base
+          set +e
+          for URL in \
+            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?versionCode=10' \
+            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?version=latest'; do
+            rm -f work/current.xapk
+            curl -L --fail --retry 5 --retry-all-errors "$URL" -o work/current.xapk
+            unzip -tq work/current.xapk >/dev/null 2>&1 && break
+          done
+          set -e
+          unzip -q work/current.xapk -d work/xapk
+          python - <<'PY'
+          import pathlib,zipfile,json,hashlib
+          root=pathlib.Path('work/xapk')
+          apks=sorted(root.rglob('*.apk'),key=lambda p:p.stat().st_size,reverse=True)
+          if not apks: apks=[pathlib.Path('work/current.xapk')]
+          inv=[]; base=None; libapk=None; libname=None
+          for p in apks:
+              with zipfile.ZipFile(p) as z:
+                  names=z.namelist(); meta=any(n.endswith('global-metadata.dat') for n in names)
+                  libs=sorted([n for n in names if n.endswith('/libil2cpp.so') or n=='libil2cpp.so'],key=lambda n:(0 if 'arm64-v8a' in n else 1,n))
+                  inv.append({'file':str(p),'bytes':p.stat().st_size,'metadata':meta,'libs':libs})
+                  if base is None and meta: base=p
+                  if libapk is None and libs: libapk=p; libname=libs[0]
+          pathlib.Path('result/package-inventory.json').write_text(json.dumps(inv,indent=2))
+          if not base or not libapk: raise SystemExit(f'missing pair: {inv}')
+          with zipfile.ZipFile(base) as z: z.extractall('work/base')
+          with zipfile.ZipFile(libapk) as z: z.extract(libname,'work/base')
+          meta=next(pathlib.Path('work/base').rglob('global-metadata.dat')); lib=pathlib.Path('work/base')/libname
+          sha=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+          pathlib.Path('work/meta.txt').write_text(str(meta.resolve())); pathlib.Path('work/lib.txt').write_text(str(lib.resolve()))
+          pathlib.Path('result/input.json').write_text(json.dumps({'base':base.name,'lib_apk':libapk.name,'lib_entry':libname,'metadata_sha256':sha(meta),'lib_sha256':sha(lib)},indent=2))
+          PY
+
+      - name: Recover and decompile target methods
+        run: |
+          TOOL=$(cat work/tool_path.txt)
+          export NO_COLOR=true
+          "$TOOL" \
+            --force-binary-path="$(cat work/lib.txt)" \
+            --force-metadata-path="$(cat work/meta.txt)" \
+            --force-unity-version=2022.3.62f3 \
+            --output-as=dll_il_recovery \
+            --output-to="$(pwd)/work/recovered" \
+            --verbose > result/cpp2il.log 2>&1
+          grep -E 'successfully decompiled|Outputting assembly|Finished' result/cpp2il.log | tail -80 || true
+          mkdir -p result/decompiled
+          found=0
+          for DLL in \
+            work/recovered/AssemblyCSharp.dll \
+            work/recovered/Assembly-CSharp.dll \
+            work/recovered/UnityDAOFramework.Runtime.dll \
+            work/recovered/TheVayuputra.dll; do
+            [ -f "$DLL" ] || continue
+            found=$((found+1))
+            NAME=$(basename "$DLL" .dll)
+            ilspycmd -p -o "result/decompiled/$NAME" "$DLL" > "result/ilspy_${NAME}.log" 2>&1
+          done
+          test "$found" -gt 0
+
+      - name: Select path logic and hash methods
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil,json,re,hashlib
+          root=Path('result/decompiled'); out=Path('result/targets'); out.mkdir(parents=True,exist_ok=True)
+          targets=['DAOImageService','DAOVideoService','DAODownloadService','DAOResourceLoaderComponentBase','DAONetService','DAOCheckDAONetService','DAONetConfig','NetConfigs','DAOImageInfo','DAOVideoInfo','DAOImageData','DAOVideoData','DAOVideoDataList','DAOImageForm','DAOVideoForm','DAOImageLoader','DAOVideoLoader','DAOSlideComponent','DAOGameEntry','PlatformComponentBase','UsereAttributes','PrivateImplementationDetails']
+          rows=[]
+          for p in root.rglob('*.cs'):
+              txt=p.read_text(errors='replace')
+              if any(t.lower() in p.name.lower() or t.lower() in txt[:5000].lower() for t in targets):
+                  rel=p.relative_to(root); dst=out/rel; dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(p,dst)
+                  rows.append({'file':str(rel),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+          Path('result/target-inventory.json').write_text(json.dumps(rows,indent=2))
+          pats=[r'\{0\}/\{1:x\}/\{2\}',r'\.png',r'\.download',r'data_config',r'ResourceUrl',r'CommonUrl',r'temp_video',r'video\.mp4',r'MD5',r'GetHashCode',r'ComputeStringHash',r'DiskCachePath',r'PreDownload',r'StartOnDownloadRes',r'CheckUsereAttributes',r'is review',r'USpecial1']
+          hits=[]
+          for p in out.rglob('*.cs'):
+              lines=p.read_text(errors='replace').splitlines()
+              for i,line in enumerate(lines):
+                  if any(re.search(pt,line,re.I) for pt in pats):
+                      hits.append({'file':str(p.relative_to(out)),'line':i+1,'text':line.strip(),'context':'\n'.join(f'{j+1:06d}: {lines[j]}' for j in range(max(0,i-25),min(len(lines),i+45)))})
+          Path('result/path-hits.json').write_text(json.dumps(hits,ensure_ascii=False,indent=2))
+          Path('result/path-hits.txt').write_text('\n\n'.join(f"=== {h['file']}:{h['line']} ===\n{h['context']}" for h in hits),encoding='utf-8')
+          PY
+
+      - name: Package sanitized output
+        if: always()
+        run: |
+          rm -rf work
+          find result -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.so' -o -name 'global-metadata.dat' -o -name '*.dll' \) -delete
+          zip -r -9 cupids-arrow-target-decompile-fast.zip result
+          sha256sum cupids-arrow-target-decompile-fast.zip > cupids-arrow-target-decompile-fast.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cupids-arrow-target-decompile-fast
+          path: |
+            cupids-arrow-target-decompile-fast.zip
+            cupids-arrow-target-decompile-fast.zip.sha256
+            result/
+          compression-level: 0
+          retention-days: 7
