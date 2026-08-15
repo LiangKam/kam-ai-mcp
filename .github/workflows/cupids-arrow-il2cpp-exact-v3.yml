@@ -1,0 +1,127 @@
+name: Cupid Arrow exact IL2CPP media path v3
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-il2cpp-exact-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        run: sudo apt-get update && sudo apt-get install -y unzip zip binutils-aarch64-linux-gnu
+
+      - name: Extract public current IL2CPP pair
+        run: |
+          mkdir -p work/xapk work/input work/output result
+          curl -L --fail --retry 4 --retry-all-errors 'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?version=latest' -o work/current.xapk
+          unzip -q work/current.xapk -d work/xapk
+          python - <<'PY'
+          import pathlib,zipfile,shutil,json,hashlib
+          root=pathlib.Path('work/xapk'); inp=pathlib.Path('work/input')
+          apks=sorted(root.rglob('*.apk'),key=lambda p:p.stat().st_size,reverse=True)
+          base=split=None; rows=[]
+          for p in apks:
+              with zipfile.ZipFile(p) as z:
+                  ns=z.namelist(); hm=any(x.endswith('global-metadata.dat') for x in ns); hl=any(x.endswith('libil2cpp.so') for x in ns)
+                  rows.append({'name':p.name,'bytes':p.stat().st_size,'metadata':hm,'libil2cpp':hl})
+                  if hm and base is None: base=p
+                  if hl and split is None: split=p
+          if not base or not split: raise SystemExit('IL2CPP pair missing')
+          with zipfile.ZipFile(base) as z:
+              n=next(x for x in z.namelist() if x.endswith('global-metadata.dat')); inp.joinpath('global-metadata.dat').write_bytes(z.read(n))
+          with zipfile.ZipFile(split) as z:
+              n=next(x for x in z.namelist() if x.endswith('libil2cpp.so')); inp.joinpath('libil2cpp.so').write_bytes(z.read(n))
+          def sha(p): return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+          pathlib.Path('result/input.json').write_text(json.dumps({'apks':rows,'metadata_sha256':sha(inp/'global-metadata.dat'),'libil2cpp_sha256':sha(inp/'libil2cpp.so')},indent=2))
+          PY
+
+      - name: Build target-only annotated dumper
+        run: |
+          git clone --depth 1 https://github.com/rodroidmods/il2cpp-dumper-rs.git work/dumper
+          python - <<'PY'
+          import pathlib,json
+          p=pathlib.Path('work/dumper/src/output/decompiler.rs'); s=p.read_text()
+          old='let flat_disasm = if want_flat_disasm { &disasm } else { &None };'
+          new='''let target_type_name = metadata.get_string_from_index(metadata.type_defs[*type_def_index].name_index).unwrap_or_default();
+                let target_disasm = ["DAOImageService","DAOVideoService","DAODownloadService","DAONetService","DAONetConfig","NetConfigs","DAOImageInfo","DAOVideoInfo","DAOImageData","DAOVideoData","DAOImageForm","DAOVideoForm","DAOImageLoader","DAOVideoLoader","CheckUsereAttributes","UsereAttributes","DAOGameEntry","DAOSlideComponent"].iter().any(|needle| target_type_name.contains(needle));
+                let flat_disasm = if want_flat_disasm && target_disasm { &disasm } else { &None };'''
+          if old not in s: raise SystemExit('patch anchor missing')
+          p.write_text(s.replace(old,new,1))
+          c=pathlib.Path('work/dumper/Cargo.toml'); t=c.read_text().replace('lto = "fat"','lto = false').replace('codegen-units = 1','codegen-units = 16'); c.write_text(t)
+          cfg=json.loads(pathlib.Path('work/dumper/config.json').read_text())
+          cfg.update({'dumpAttribute':False,'generateStruct':False,'generateDummyDll':False,'splitDumpPerType':False,'generateGenericsDump':False,'dumpGenericsRgctx':False,'dumpGenericsMethodSpecs':False,'dumpGenericsCustomAttributes':False,'dumpGenericsStringLiterals':False,'dumpGenericsMetadataUsages':False,'dumpGenericsVtables':False,'dumpGenericsInterfaces':False,'dumpDisassembly':True,'dumpDisassemblyTarget':1,'maxDisassemblyInstructions':1600,'generateCppScaffold':False,'mangleNames':False,'generateUnityHeaders':False,'dumpStaticFieldMetadata':False,'dumpFieldRvaData':False})
+          pathlib.Path('work/dumper/cupid-config.json').write_text(json.dumps(cfg,indent=2))
+          PY
+          cd work/dumper && cargo build --release
+
+      - name: Dump and extract relevant classes
+        run: |
+          work/dumper/target/release/il2cpp_dumper --binary "$(realpath work/input/libil2cpp.so)" --metadata "$(realpath work/input/global-metadata.dat)" --output "$(realpath work/output)" --config "$(realpath work/dumper/cupid-config.json)" > result/dumper.log 2>&1
+          cat result/dumper.log
+          python - <<'PY'
+          import pathlib,re,json,shutil
+          dumps=list(pathlib.Path('work/output').rglob('dump.cs'))
+          if not dumps: raise SystemExit('dump.cs not found')
+          dump=dumps[0]; lines=dump.read_text(errors='replace').splitlines(); out=pathlib.Path('result')
+          targets=['DAOImageService','DAOVideoService','DAODService','DAODownloadService','DAONetService','DAONetConfig','NetConfigs','DAOImageInfo','DAOVideoInfo','DAOImageData','DAOVideoData','DAOImageForm','DAOVideoForm','DAOImageLoader','DAOVideoLoader','CheckUsereAttributes','UsereAttributes','DAOGameEntry','DAOSlideComponent']
+          literals=['{0}.png','{0}.download','/ImageCache/','ImageCache','temp_video.mp4','video.mp4','video/','{0}/data_config.txt','{0}/{1:x}/{2}','{0}/{1}','ResourceUrl','CommonUrl','CommoTestUrl']
+          decl=re.compile(r'\b(class|struct|enum)\s+([^\s:{]+)'); captures=[]; methods=[]
+          i=0
+          while i<len(lines):
+              m=decl.search(lines[i])
+              if not m or not any(t.lower() in (lines[i]+' '+m.group(2)).lower() for t in targets): i+=1; continue
+              start=max(0,i-18); depth=0; opened=False; j=i
+              while j<len(lines):
+                  depth+=lines[j].count('{')-lines[j].count('}'); opened|='{' in lines[j]
+                  if opened and depth<=0 and j>i: break
+                  j+=1
+              captures += ['\n'+'='*120,f'// {m.group(2)} dump lines {start+1}-{j+1}']+lines[start:min(j+1,len(lines))]
+              i=j+1
+          (out/'target_types_annotated.cs').write_text('\n'.join(captures),encoding='utf-8')
+          contexts=[]
+          for n,line in enumerate(lines):
+              if any(x in line for x in literals): contexts += ['\n'+'-'*100,f'// line {n+1}']+lines[max(0,n-20):min(len(lines),n+35)]
+          (out/'literal_context.txt').write_text('\n'.join(contexts),encoding='utf-8')
+          off=re.compile(r'RVA:\s*0x([0-9A-Fa-f]+).*?Offset:\s*0x([0-9A-Fa-f]+).*?VA:\s*0x([0-9A-Fa-f]+)')
+          current=''; target=False; depth=0; pending=None
+          for n,line in enumerate(lines):
+              m=decl.search(line)
+              if m: current=m.group(2); target=any(t.lower() in (line+' '+current).lower() for t in targets); depth=0; pending=None
+              if target:
+                  depth+=line.count('{')-line.count('}')
+                  om=off.search(line)
+                  if om: pending=om.groups()
+                  elif pending and '(' in line and ')' in line and (';' in line or '{' in line): methods.append({'type':current,'line':n+1,'rva':'0x'+pending[0],'offset':'0x'+pending[1],'va':'0x'+pending[2],'declaration':line.strip()}); pending=None
+          (out/'target_methods.json').write_text(json.dumps(methods,ensure_ascii=False,indent=2))
+          (out/'summary.json').write_text(json.dumps({'dump_path':str(dump),'dump_lines':len(lines),'captures':sum(1 for x in captures if x.startswith('// ')),'target_methods':len(methods),'target_bytes':(out/'target_types_annotated.cs').stat().st_size,'literal_context_bytes':(out/'literal_context.txt').stat().st_size},indent=2))
+          PY
+
+      - name: Sanitize and package
+        if: always()
+        run: |
+          rm -rf work
+          find result -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.so' -o -name 'global-metadata.dat' \) -delete
+          printf '%s\n' "workflow=${GITHUB_WORKFLOW}" "run_id=${GITHUB_RUN_ID}" "sha=${GITHUB_SHA}" > result/github-run.txt
+          zip -r -9 cupids-arrow-il2cpp-exact-v3-results.zip result
+          sha256sum cupids-arrow-il2cpp-exact-v3-results.zip > cupids-arrow-il2cpp-exact-v3-results.zip.sha256
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-il2cpp-exact-v3-results
+          path: |
+            cupids-arrow-il2cpp-exact-v3-results.zip
+            cupids-arrow-il2cpp-exact-v3-results.zip.sha256
+            result/
+          compression-level: 0
+          retention-days: 7
