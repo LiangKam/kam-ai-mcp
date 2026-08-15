@@ -1,0 +1,158 @@
+name: Cupid Arrow historical package and IL2CPP probe
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-history-and-il2cpp.yml'
+      - 'tools/cupids_arrow_history_probe.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install system and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip p7zip-full file jq binutils-aarch64-linux-gnu zip
+          python -m pip install --upgrade pip
+          python -m pip install requests
+      - name: Download public package history, scan selected files, and test public object paths
+        env:
+          HISTORY_WORK: history-work
+          HISTORY_OUT: history-output
+          PYTHONUNBUFFERED: '1'
+        run: python tools/cupids_arrow_history_probe.py
+      - name: Build metadata-v31 IL2CPP dumper
+        run: |
+          git clone --depth 1 https://github.com/rodroidmods/il2cpp-dumper-rs.git il2cpp-dumper-rs
+          cd il2cpp-dumper-rs/il2cpp_dumper
+          cat > config.json <<'JSON'
+          {
+            "dumpMethod": true,
+            "dumpField": true,
+            "dumpProperty": true,
+            "dumpAttribute": false,
+            "dumpMethodOffset": true,
+            "dumpFieldOffset": true,
+            "dumpTypeDefIndex": true,
+            "dumpAssemblyName": true,
+            "splitDumpPerType": false,
+            "generateStruct": false,
+            "generateDummyDll": false,
+            "dummyDllAddToken": true,
+            "generateGenericsDump": false,
+            "dumpGenericsRgctx": false,
+            "dumpGenericsMethodSpecs": false,
+            "dumpGenericsCustomAttributes": false,
+            "dumpGenericsStringLiterals": false,
+            "dumpGenericsMetadataUsages": false,
+            "dumpGenericsVtables": false,
+            "dumpGenericsInterfaces": false,
+            "dumpDisassembly": false,
+            "generateCppScaffold": false,
+            "enhancedIdaMetadata": true,
+            "generateUnityHeaders": false,
+            "dumpStaticFieldMetadata": false
+          }
+          JSON
+          cargo build --release
+      - name: Dump unique IL2CPP candidates and extract target methods
+        env:
+          HISTORY_WORK: history-work
+          HISTORY_OUT: history-output
+        run: |
+          python - <<'PY'
+          import hashlib,json,pathlib,subprocess,os,re,shutil
+          root=pathlib.Path('.')
+          out=pathlib.Path('history-output/il2cpp'); out.mkdir(parents=True,exist_ok=True)
+          candidates=json.loads(pathlib.Path('history-output/reports/il2cpp_candidates.json').read_text())
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for b in iter(lambda:f.read(1024*1024),b''): h.update(b)
+              return h.hexdigest()
+          unique=[]; seen=set()
+          for c in candidates:
+              key=(sha(c['lib']),sha(c['metadata']))
+              if key in seen: continue
+              seen.add(key); c=dict(c); c['lib_sha256'],c['metadata_sha256']=key; unique.append(c)
+          pathlib.Path('history-output/reports/unique_il2cpp_candidates.json').write_text(json.dumps(unique,ensure_ascii=False,indent=2))
+          dumper=root/'il2cpp-dumper-rs/il2cpp_dumper/target/release/il2cpp_dumper'
+          target_terms=['DAOImageService','DAOVideoService','DAODownloadService','DAONetService','DAONetConfig','DAOImageInfo','DAOVideoInfo','DAOImageData','DAOVideoData','NetConfigs','CheckUsereAttributes','UsereAttributes']
+          summary=[]
+          for i,c in enumerate(unique[:4]):
+              od=out/f'dump_{i:02d}'; od.mkdir(parents=True,exist_ok=True)
+              log=od/'dumper.log'
+              with log.open('w') as f:
+                  p=subprocess.run([str(dumper.resolve()),str(pathlib.Path(c['lib']).resolve()),str(pathlib.Path(c['metadata']).resolve()),str(od.resolve())],cwd='il2cpp-dumper-rs/il2cpp_dumper',stdout=f,stderr=subprocess.STDOUT,text=True,timeout=1200)
+              rec={**c,'output':str(od),'returncode':p.returncode}
+              dump=od/'dump.cs'
+              if dump.exists():
+                  lines=dump.read_text(errors='replace').splitlines()
+                  hits=[]; indexes=set()
+                  for n,line in enumerate(lines):
+                      if any(t.lower() in line.lower() for t in target_terms):
+                          for j in range(max(0,n-25),min(len(lines),n+220)): indexes.add(j)
+                  for j in sorted(indexes): hits.append(f'{j+1:08d}: {lines[j]}')
+                  (od/'relevant_dump_context.txt').write_text('\n'.join(hits),encoding='utf-8')
+                  # Track target class while collecting method RVA/offset comments and declarations.
+                  methods=[]; current=''; pending=None
+                  class_re=re.compile(r'\b(class|struct|enum)\s+([^\s:{]+)')
+                  off_re=re.compile(r'RVA:\s*0x([0-9A-Fa-f]+).*?Offset:\s*0x([0-9A-Fa-f]+).*?VA:\s*0x([0-9A-Fa-f]+)')
+                  depth=0; target=False
+                  for n,line in enumerate(lines):
+                      m=class_re.search(line)
+                      if m and any(t.lower() in line.lower() for t in target_terms): current=m.group(2); target=True; depth=0
+                      if target:
+                          depth += line.count('{')-line.count('}')
+                          om=off_re.search(line)
+                          if om: pending=(n,om.groups(),line.strip())
+                          elif pending and ('(' in line and ')' in line and line.strip().endswith((';','{'))):
+                              methods.append({'class':current,'line':n+1,'rva':'0x'+pending[1][0],'offset':'0x'+pending[1][1],'va':'0x'+pending[1][2],'declaration':line.strip()}); pending=None
+                          if depth<0 or (depth==0 and n>0 and line.strip()=='}'): target=False; current=''; pending=None
+                  (od/'target_methods.json').write_text(json.dumps(methods,ensure_ascii=False,indent=2),encoding='utf-8')
+                  # Produce bounded native disassembly for each unique target RVA.
+                  dis=[]; seen_rva=set()
+                  for m in methods:
+                      rv=int(m['rva'],16)
+                      if rv==0 or rv in seen_rva: continue
+                      seen_rva.add(rv)
+                      stop=rv+0x500
+                      q=subprocess.run(['aarch64-linux-gnu-objdump','-d',f'--start-address={rv}',f'--stop-address={stop}',c['lib']],capture_output=True,text=True,timeout=60)
+                      dis += ['\n'+'='*100,json.dumps(m,ensure_ascii=False),q.stdout,q.stderr]
+                  (od/'target_native_disassembly.txt').write_text('\n'.join(dis),encoding='utf-8')
+                  # Keep full dump and string literals but remove bulky generated artifacts unrelated to the target.
+                  for child in list(od.iterdir()):
+                      if child.is_dir() and child.name.lower() in {'dummydll','cpp_project','diffablecs'}: shutil.rmtree(child,ignore_errors=True)
+                  rec['dump_size']=dump.stat().st_size; rec['target_methods']=len(methods)
+              summary.append(rec)
+          pathlib.Path('history-output/reports/il2cpp_dump_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Remove executable inputs from artifact and package evidence
+        if: always()
+        run: |
+          rm -rf history-work/packages history-work/extracted il2cpp-dumper-rs
+          find history-output -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.apks' -o -name 'libil2cpp.so' -o -name 'global-metadata.dat' \) -delete
+          printf '%s\n' "workflow=${GITHUB_WORKFLOW}" "run_id=${GITHUB_RUN_ID}" "sha=${GITHUB_SHA}" > history-output/github-run.txt
+          zip -r -9 cupids-arrow-history-il2cpp-results.zip history-output
+          sha256sum cupids-arrow-history-il2cpp-results.zip > cupids-arrow-history-il2cpp-results.zip.sha256
+      - name: Upload evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-history-il2cpp-results
+          path: |
+            cupids-arrow-history-il2cpp-results.zip
+            cupids-arrow-history-il2cpp-results.zip.sha256
+            history-output/
+          compression-level: 0
+          retention-days: 7
