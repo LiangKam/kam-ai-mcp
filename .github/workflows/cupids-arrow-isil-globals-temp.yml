@@ -1,0 +1,128 @@
+name: TEMP Cupid Arrow ISIL global resolver
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-isil-globals-temp.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip jq file
+          mkdir -p work result
+
+      - name: Build target ISIL resolver
+        run: |
+          git clone --depth 1 --branch development https://github.com/SamboyCoding/Cpp2IL.git work/src
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('work/src/Cpp2IL.Core/OutputFormats/IsilDumpOutputFormat.cs')
+          s=p.read_text()
+          s=s.replace('using System.IO;\n', 'using System.IO;\nusing System.Globalization;\nusing System.Text.RegularExpressions;\n')
+          anchor='''                if (type.Methods.Count == 0)\n                    return;\n\n                var typeDump = new StringBuilder();'''
+          replacement='''                if (type.Methods.Count == 0)\n                    return;\n\n                var targetNames = new[]\n                {\n                    "DAOImageService", "DAOVideoService", "DAODownloadService",\n                    "DAOResourceLoaderComponentBase", "DAONetService", "DAOCheckDAONetService",\n                    "DAOConfigComponent", "DAONetConfig", "NetConfigs", "DAOImageInfo",\n                    "DAOVideoInfo", "DAOImageData", "DAOVideoData", "DAOVideoDataList",\n                    "DAOImageForm", "DAOVideoForm", "DAOImageLoader", "DAOVideoLoader",\n                    "DAOSlideComponent", "DAOGameEntry", "GameEntry", "PlatformComponentBase",\n                    "CheckUsereAttributes", "UsereAttributes", "PrivateImplementationDetails"\n                };\n                var fullName = type.Definition?.FullName ?? type.Name ?? string.Empty;\n                if (!targetNames.Any(n => fullName.Contains(n, StringComparison.OrdinalIgnoreCase)))\n                    return;\n\n                var typeDump = new StringBuilder();'''
+          if anchor not in s: raise SystemExit('type filter anchor missing')
+          s=s.replace(anchor,replacement,1)
+          anchor2='''                        foreach (var isilInsn in method.ConvertedIsil)\n                        {\n                            typeDump.Append('\\t').Append(isilInsn).AppendLine();\n                        }'''
+          replacement2='''                        var resolvedForMethod = new HashSet<ulong>();\n                        foreach (var isilInsn in method.ConvertedIsil)\n                        {\n                            var line = isilInsn.ToString();\n                            typeDump.Append('\\t').Append(line).AppendLine();\n                            foreach (Match match in Regex.Matches(line, @"\\[([0-9A-Fa-f]{6,})\\]"))\n                            {\n                                if (!ulong.TryParse(match.Groups[1].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address))\n                                    continue;\n                                if (!resolvedForMethod.Add(address))\n                                    continue;\n                                try\n                                {\n                                    var usage = context.LibCpp2IlContext.GetAnyGlobalByAddress(address);\n                                    if (usage == null)\n                                    {\n                                        typeDump.Append("\\t\\tGLOBAL 0x").Append(address.ToString("X"))\n                                            .AppendLine(" => <not-metadata-usage>");\n                                        continue;\n                                    }\n                                    string value;\n                                    try\n                                    {\n                                        value = usage.Value?.ToString() ?? string.Empty;\n                                    }\n                                    catch (Exception valueException)\n                                    {\n                                        value = "<value-error:" + valueException.GetType().Name + ":" + valueException.Message + ">";\n                                    }\n                                    value = value.Replace("\\r", "\\\\r").Replace("\\n", "\\\\n");\n                                    typeDump.Append("\\t\\tGLOBAL 0x").Append(address.ToString("X"))\n                                        .Append(" => ").Append(usage.Type).Append(" | ").AppendLine(value);\n                                }\n                                catch (Exception globalException)\n                                {\n                                    typeDump.Append("\\t\\tGLOBAL 0x").Append(address.ToString("X"))\n                                        .Append(" => <resolve-error:").Append(globalException.GetType().Name)\n                                        .Append(':').Append(globalException.Message.Replace("\\n", " ")).AppendLine(">");\n                                }\n                            }\n                        }'''
+          if anchor2 not in s: raise SystemExit('ISIL loop anchor missing')
+          p.write_text(s.replace(anchor2,replacement2,1))
+          PY
+          cd work/src
+          dotnet restore -r linux-x64
+          dotnet publish ./Cpp2IL/Cpp2IL.csproj -c Release -f net10.0 -r linux-x64 \
+            --self-contained --no-restore -o ../tool
+          chmod +x ../tool/Cpp2IL
+
+      - name: Download and identify package
+        run: |
+          mkdir -p work/xapk work/base
+          for URL in \
+            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?versionCode=10' \
+            'https://d.apkpure.net/b/XAPK/com.cupidarrow.arrowout.puzzle.gp?version=latest'; do
+            rm -f work/current.xapk
+            curl -L --fail --retry 5 --retry-all-errors "$URL" -o work/current.xapk || true
+            unzip -tq work/current.xapk >/dev/null 2>&1 && break
+          done
+          unzip -q work/current.xapk -d work/xapk
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile,json,hashlib
+          root=Path('work/xapk'); apks=sorted(root.rglob('*.apk'),key=lambda p:p.stat().st_size,reverse=True)
+          if not apks: apks=[Path('work/current.xapk')]
+          base=libapk=libname=None; inv=[]
+          for p in apks:
+              with zipfile.ZipFile(p) as z:
+                  ns=z.namelist(); has_meta=any(n.endswith('global-metadata.dat') for n in ns)
+                  libs=sorted([n for n in ns if n.endswith('/libil2cpp.so') or n=='libil2cpp.so'],key=lambda n:(0 if 'arm64-v8a' in n else 1,n))
+                  inv.append({'file':str(p),'bytes':p.stat().st_size,'metadata':has_meta,'libs':libs})
+                  if base is None and has_meta: base=p
+                  if libapk is None and libs: libapk=p; libname=libs[0]
+          Path('result/package-inventory.json').write_text(json.dumps(inv,indent=2))
+          if not base or not libapk: raise SystemExit(str(inv))
+          with zipfile.ZipFile(base) as z:z.extractall('work/base')
+          with zipfile.ZipFile(libapk) as z:z.extract(libname,'work/base')
+          meta=next(Path('work/base').rglob('global-metadata.dat')); lib=Path('work/base')/libname
+          Path('work/meta.txt').write_text(str(meta.resolve())); Path('work/lib.txt').write_text(str(lib.resolve()))
+          h=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+          Path('result/input.json').write_text(json.dumps({'base':base.name,'lib_source':libapk.name,'lib_entry':libname,'metadata_sha256':h(meta),'lib_sha256':h(lib)},indent=2))
+          PY
+
+      - name: Dump target ISIL and resolved globals
+        run: |
+          export NO_COLOR=true
+          work/tool/Cpp2IL \
+            --force-binary-path="$(cat work/lib.txt)" \
+            --force-metadata-path="$(cat work/meta.txt)" \
+            --force-unity-version=2022.3.62f3 \
+            --output-as=isil \
+            --output-to="$(pwd)/result/output" \
+            --verbose > result/cpp2il.log 2>&1
+          grep -Rho 'GLOBAL 0x[^[:space:]]* => .*' result/output | sort -u > result/resolved-globals.txt || true
+          grep -Rho 'GLOBAL 0x[^[:space:]]* => StringLiteral | .*' result/output | sort -u > result/resolved-string-literals.txt || true
+          python - <<'PY'
+          from pathlib import Path
+          import json,re
+          rows=[]
+          for p in Path('result/output').rglob('*.txt'):
+              method=''
+              for n,line in enumerate(p.read_text(errors='replace').splitlines(),1):
+                  if line.startswith('Method: '): method=line[len('Method: '):]
+                  m=re.search(r'GLOBAL 0x([0-9A-F]+) => ([^|]+?)(?: \| (.*))?$',line.strip())
+                  if m: rows.append({'file':str(p.relative_to('result/output')),'line':n,'method':method,'address':'0x'+m.group(1),'usage_type':m.group(2).strip(),'value':m.group(3) or ''})
+          Path('result/resolved-globals.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2))
+          Path('result/summary.json').write_text(json.dumps({'files':len(list(Path('result/output').rglob('*.txt'))),'resolved_rows':len(rows),'string_literals':sum(1 for r in rows if r['usage_type']=='StringLiteral')},indent=2))
+          PY
+
+      - name: Sanitize and upload
+        if: always()
+        run: |
+          rm -rf work
+          find result -type f \( -name '*.apk' -o -name '*.xapk' -o -name '*.so' -o -name 'global-metadata.dat' -o -name '*.dll' \) -delete
+          zip -r -9 cupids-arrow-isil-globals.zip result
+          sha256sum cupids-arrow-isil-globals.zip > cupids-arrow-isil-globals.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cupids-arrow-isil-globals
+          path: |
+            cupids-arrow-isil-globals.zip
+            cupids-arrow-isil-globals.zip.sha256
+            result/
+          compression-level: 0
+          retention-days: 7
