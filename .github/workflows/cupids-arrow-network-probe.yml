@@ -1,0 +1,58 @@
+name: Cupid Arrow public endpoint probe
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cupids-arrow-network-probe.yml'
+      - 'tools/cupids_arrow_probe.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install probe dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dnsutils curl openssl file ffmpeg zip
+          python -m pip install --upgrade pip
+          python -m pip install requests brotli
+
+      - name: Run public endpoint probe
+        env:
+          PROBE_OUT: probe-output
+          PYTHONUNBUFFERED: '1'
+        run: python tools/cupids_arrow_probe.py
+
+      - name: Build downloadable bundle
+        if: always()
+        run: |
+          mkdir -p probe-output
+          printf '%s\n' "workflow=${GITHUB_WORKFLOW}" "run_id=${GITHUB_RUN_ID}" "run_attempt=${GITHUB_RUN_ATTEMPT}" "sha=${GITHUB_SHA}" > probe-output/github-run.txt
+          zip -r -9 cupids-arrow-probe-results.zip probe-output
+          sha256sum cupids-arrow-probe-results.zip > cupids-arrow-probe-results.zip.sha256
+
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cupids-arrow-probe-results
+          path: |
+            cupids-arrow-probe-results.zip
+            cupids-arrow-probe-results.zip.sha256
+            probe-output/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7
